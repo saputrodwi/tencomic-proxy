@@ -106,18 +106,13 @@ export default {
 
     if (nonceExpr && !nonce) {
       try {
-        const fn = new Function(
-          'window', 'Math', 'parseInt', 'Array', 'String', 'Number', 'Boolean', 'eval',
-          'return (' + nonceExpr + ');'
-        );
-        nonce = fn(
-          { Array, Math, parseInt, String, Number, Boolean },
-          Math, parseInt, Array, String, Number, Boolean, eval
-        );
+        // Menggunakan Safe Parser untuk menghindari error CSP Cloudflare
+        nonce = evaluateNonceExpr(nonceExpr);
+        if (typeof nonce !== 'string') nonce = String(nonce);
       } catch (e) {
         return jsonResp({
           status: "error",
-          message: "Gagal evaluasi nonce: " + e.message,
+          message: "Gagal evaluasi nonce (safe parser): " + e.message,
           nonceExpr: nonceExpr.slice(0, 300)
         }, 500);
       }
@@ -210,6 +205,8 @@ export default {
   }
 };
 
+// ===== HELPER FUNCTIONS =====
+
 function jsonResp(obj, status = 200) {
   return new Response(JSON.stringify(obj, null, 2), {
     status,
@@ -218,4 +215,185 @@ function jsonResp(obj, status = 200) {
       "Access-Control-Allow-Origin": "*",
     },
   });
+}
+
+function safeMathEval(str) {
+  str = str.trim();
+  if ((str.startsWith('"') && str.endsWith('"')) || (str.startsWith("'") && str.endsWith("'"))) {
+    return str.slice(1, -1);
+  }
+  const tokens = str.match(/(\d+\.\d+|\d+|[+\-*/()])/g);
+  if (!tokens) return 0;
+  let pos = 0;
+  
+  function parseExpression() {
+    let node = parseTerm();
+    while (pos < tokens.length && (tokens[pos] === '+' || tokens[pos] === '-')) {
+      const op = tokens[pos++];
+      const right = parseTerm();
+      if (op === '+') node += right;
+      else node -= right;
+    }
+    return node;
+  }
+  function parseTerm() {
+    let node = parseFactor();
+    while (pos < tokens.length && (tokens[pos] === '*' || tokens[pos] === '/')) {
+      const op = tokens[pos++];
+      const right = parseFactor();
+      if (op === '*') node *= right;
+      else node /= right;
+    }
+    return node;
+  }
+  function parseFactor() {
+    if (pos >= tokens.length) return 0;
+    if (tokens[pos] === '(') {
+      pos++;
+      const node = parseExpression();
+      if (pos < tokens.length && tokens[pos] === ')') pos++;
+      return node;
+    }
+    if (tokens[pos] === '+') { pos++; return parseFactor(); }
+    if (tokens[pos] === '-') { pos++; return -parseFactor(); }
+    return parseFloat(tokens[pos++]);
+  }
+  return parseExpression();
+}
+
+function evaluateNonceExpr(expr) {
+  const tokens = [];
+  let i = 0;
+  while (i < expr.length) {
+    if (expr[i] === ' ' || expr[i] === '\n' || expr[i] === '\r' || expr[i] === '\t') { i++; continue; }
+    if (expr[i] === '"' || expr[i] === "'") {
+      const quote = expr[i];
+      let str = '';
+      i++;
+      while (i < expr.length && expr[i] !== quote) {
+        if (expr[i] === '\\') {
+          i++;
+          if (expr[i] === 'n') str += '\n';
+          else if (expr[i] === 't') str += '\t';
+          else str += expr[i];
+        } else { str += expr[i]; }
+        i++;
+      }
+      i++;
+      tokens.push({type: 'STRING', value: str});
+    } else if (expr[i] >= '0' && expr[i] <= '9') {
+      let num = '';
+      while (i < expr.length && ((expr[i] >= '0' && expr[i] <= '9') || expr[i] === '.')) {
+        num += expr[i]; i++;
+      }
+      tokens.push({type: 'NUMBER', value: parseFloat(num)});
+    } else if (expr[i] === '+' || expr[i] === '-' || expr[i] === '*' || expr[i] === '/' || expr[i] === '(' || expr[i] === ')' || expr[i] === ',') {
+      tokens.push({type: 'OP', value: expr[i]}); i++;
+    } else if (expr[i] === '.') {
+      tokens.push({type: 'DOT', value: '.'}); i++;
+    } else if (/[a-zA-Z_$]/.test(expr[i])) {
+      let id = '';
+      while (i < expr.length && /[a-zA-Z0-9_$]/.test(expr[i])) {
+        id += expr[i]; i++;
+      }
+      tokens.push({type: 'ID', value: id});
+    } else { i++; }
+  }
+  
+  let pos = 0;
+  function peek(offset = 0) { return tokens[pos + offset]; }
+  function consume() { return tokens[pos++]; }
+  function expect(type, value) {
+    if (pos >= tokens.length) throw new Error("Unexpected end of expression");
+    const t = consume();
+    if (t.type !== type || (value !== undefined && t.value !== value)) {
+      throw new Error("Unexpected token");
+    }
+    return t;
+  }
+  
+  function parseExpression() {
+    let left = parseTerm();
+    while (peek() && peek().type === 'OP' && peek().value === '+') {
+      consume();
+      const right = parseTerm();
+      if (typeof left === 'string' || typeof right === 'string') {
+        left = String(left) + String(right);
+      } else {
+        left = left + right;
+      }
+    }
+    return left;
+  }
+  
+  function parseTerm() {
+    let left = parseFactor();
+    while (peek() && peek().type === 'OP' && (peek().value === '*' || peek().value === '/')) {
+      const op = consume().value;
+      const right = parseFactor();
+      if (op === '*') left *= right;
+      else left /= right;
+    }
+    return left;
+  }
+  
+  function parseFactor() {
+    let node;
+    if (pos >= tokens.length) throw new Error("Unexpected end");
+    const t = peek();
+    if (t.type === 'STRING') { node = consume().value; }
+    else if (t.type === 'NUMBER') { node = consume().value; }
+    else if (t.type === 'OP' && t.value === '(') {
+      consume();
+      node = parseExpression();
+      expect('OP', ')');
+    } else if (t.type === 'ID') {
+      const id = consume().value;
+      if (id === 'eval') {
+        expect('OP', '(');
+        const argExpr = parseExpression();
+        expect('OP', ')');
+        node = safeMathEval(String(argExpr));
+      } else if (id === 'parseInt') {
+        expect('OP', '(');
+        const val = parseExpression();
+        let radix = 10;
+        if (peek() && peek().type === 'OP' && peek().value === ',') {
+          consume();
+          radix = parseExpression();
+        }
+        expect('OP', ')');
+        node = parseInt(String(val), radix);
+      } else if (id === 'String') {
+        expect('OP', '(');
+        const val = parseExpression();
+        expect('OP', ')');
+        node = String(val);
+      } else {
+        node = 0;
+      }
+    } else if (t.type === 'OP' && (t.value === '+' || t.value === '-')) {
+      const op = consume().value;
+      node = parseFactor();
+      if (op === '-') node = -node;
+    } else {
+      throw new Error("Unexpected token: " + JSON.stringify(t));
+    }
+    
+    while (peek() && peek().type === 'DOT') {
+      consume();
+      const method = expect('ID').value;
+      if (method === 'toString') {
+        expect('OP', '(');
+        let radix = 10;
+        if (peek() && peek().type === 'NUMBER') { radix = consume().value; }
+        expect('OP', ')');
+        if (typeof node === 'number') node = node.toString(radix);
+        else node = String(node);
+      }
+    }
+    return node;
+  }
+  
+  return parseExpression();
 }

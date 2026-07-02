@@ -59,64 +59,125 @@ export default {
       return jsonResp({ error: "Gagal ambil HTML: " + e.message }, 500);
     }
 
+    // === CARI DATA DAN NONCE DI DALAM SCRIPT BLOCK YANG SAMA ===
+    const scriptBlocks = html.match(/<script[^>]*>[\s\S]*?<\/script>/gi) || [];
+    
     let dataStr = null;
-    const dataRegexes = [
-      /var\s+DATA\s*=\s*'([\s\S]+?)'/,
-      /var\s+DATA\s*=\s*"([\s\S]+?)"/,
-      /window\.DATA\s*=\s*"([\s\S]+?)"/,
-      /window\["DATA"\]\s*=\s*"([\s\S]+?)"/,
-    ];
-    for (const r of dataRegexes) {
-      const m = html.match(r);
-      if (m && m[1] && m[1].length > 100) {
-        dataStr = m[1];
-        break;
-      }
-    }
-    if (!dataStr) return jsonResp({ error: "DATA tidak ditemukan di HTML.", url: chapterUrl }, 404);
+    let targetScript = null;
 
-    // === BULLETPROOF NONCE EXTRACTOR (Multi-Assignment Aware) ===
-    const nonceRegexes = [
-      /window\["no"\s*\+\s*"nce"\]\s*=\s*([^;]+);/g,
-      /window\["no"\+"nce"\]\s*=\s*([^;]+);/g,
-      /window\.nonce\s*=\s*([^;]+);/g,
-      /window\["nonce"\]\s*=\s*([^;]+);/g
-    ];
-
-    let matches = [];
-    for (const regex of nonceRegexes) {
-      let m;
-      while ((m = regex.exec(html)) !== null) {
-        matches.push({ index: m.index, expr: m[1].trim() });
-      }
-    }
-
-    // Urutkan berdasarkan posisi di HTML dan ambil yang TERAKHIR (karena JS menimpa variabel)
-    matches.sort((a, b) => a.index - b.index);
-    let nonce = null;
-
-    if (matches.length > 0) {
-      for (let i = matches.length - 1; i >= 0; i--) {
-        try {
-          const evaluated = evaluateNonceExpression(matches[i].expr);
-          if (evaluated && evaluated.length >= 16) {
-            nonce = evaluated;
-            break;
-          }
-        } catch (e) {
-          // continue to next match
+    for (const script of scriptBlocks) {
+      if (/var\s+DATA\s*=|window\.DATA\s*=|window\["DATA"\]\s*=/.test(script)) {
+        const dataMatch = script.match(/var\s+DATA\s*=\s*'([\s\S]+?)'/) ||
+                          script.match(/var\s+DATA\s*=\s*"([\s\S]+?)"/) ||
+                          script.match(/window\.DATA\s*=\s*"([\s\S]+?)"/) ||
+                          script.match(/window\["DATA"\]\s*=\s*"([\s\S]+?)"/);
+        if (dataMatch && dataMatch[1] && dataMatch[1].length > 100) {
+          dataStr = dataMatch[1];
+          targetScript = script;
+          break;
         }
       }
     }
 
-    if (!nonce) return jsonResp({ error: "NONCE tidak ditemukan atau gagal dievaluasi.", dataLength: dataStr.length }, 404);
+    if (!dataStr || !targetScript) return jsonResp({ error: "DATA tidak ditemukan di HTML.", url: chapterUrl }, 404);
+
+    // === EKSTRAK NONCE DARI TARGET SCRIPT ===
+    let nonce = null;
+
+    // Strategi 1: Cari string literal langsung
+    const directPatterns = [
+      /window\["no"\s*\+\s*"nce"\]\s*=\s*['"]([^'"]+)['"]/,
+      /window\["nonce"\]\s*=\s*['"]([^'"]+)['"]/,
+      /window\.nonce\s*=\s*['"]([^'"]+)['"]/,
+      /var\s+nonce\s*=\s*['"]([^'"]+)['"]/,
+      /nonce\s*=\s*['"]([^'"]+)['"]/
+    ];
+
+    for (const pattern of directPatterns) {
+      const m = targetScript.match(pattern);
+      if (m && m[1] && m[1].length >= 16) {
+        nonce = m[1];
+        break;
+      }
+    }
+
+    // Strategi 2: Jika ada expression dengan eval() atau concatenation
+    if (!nonce) {
+      const exprPatterns = [
+        /window\["no"\s*\+\s*"nce"\]\s*=\s*([^;]+);/,
+        /window\["nonce"\]\s*=\s*([^;]+);/,
+        /window\.nonce\s*=\s*([^;]+);/,
+        /var\s+nonce\s*=\s*([^;]+);/,
+        /nonce\s*=\s*([^;]+);/
+      ];
+
+      for (const pattern of exprPatterns) {
+        const m = targetScript.match(pattern);
+        if (m && m[1]) {
+          const expr = m[1].trim();
+          
+          const stringMatches = [...expr.matchAll(/(['"])((?:\\.|(?!\1)[^\\])*)\1/g)];
+          const strings = stringMatches.map(match => match[2].replace(/\\'/g, "'").replace(/\\"/g, '"').replace(/\\\\/g, '\\'));
+          
+          const evalMatch = expr.match(/eval\s*\(\s*['"]([^'"]+)['"]\s*\)/);
+          let evalResult = '';
+          if (evalMatch) {
+            try {
+              let val = safeMathEval(evalMatch[1]);
+              const radixMatch = expr.match(/\.toString\s*\(\s*(\d+)\s*\)/);
+              if (radixMatch) {
+                const radix = parseInt(radixMatch[1], 10);
+                evalResult = Math.round(val).toString(radix);
+              } else {
+                evalResult = String(val);
+              }
+            } catch (e) {}
+          }
+          
+          if (strings.length > 0) {
+            const mainStrings = strings.filter(s => s.length > 3 && s !== evalMatch?.[1]);
+            if (mainStrings.length >= 2 && evalResult) {
+              nonce = mainStrings[0] + evalResult + mainStrings[1];
+            } else if (mainStrings.length === 1 && evalResult) {
+              nonce = mainStrings[0] + evalResult;
+            } else if (mainStrings.length > 0) {
+              nonce = mainStrings.join('');
+            }
+          }
+          
+          if (nonce && nonce.length >= 16) break;
+        }
+      }
+    }
+
+    // Strategi 3: Fallback - cari MD5 hash (32 hex chars) di targetScript
+    if (!nonce) {
+      const md5Match = targetScript.match(/['"]([a-f0-9]{32})['"]/i);
+      if (md5Match) nonce = md5Match[1];
+    }
+
+    // Strategi 4: Fallback - cari string alphanumeric 16-100 chars dengan pola \d+[a-zA-Z]+
+    if (!nonce) {
+      const allStrings = [...targetScript.matchAll(/['"]([a-zA-Z0-9]{16,100})['"]/g)].map(m => m[1]);
+      for (const s of allStrings) {
+        if (/\d+[a-zA-Z]+/.test(s) && (s.match(/\d+[a-zA-Z]+/g) || []).length >= 3) {
+          nonce = s;
+          break;
+        }
+      }
+    }
+
+    if (!nonce) return jsonResp({ 
+      error: "NONCE tidak ditemukan di dalam script block DATA.",
+      scriptSnippet: targetScript.substring(0, 500)
+    }, 404);
 
     // === DECODE DATA ===
     function decodeData(data, nonceStr) {
       const T = data.split('');
       const N = nonceStr.match(/\d+[a-zA-Z]+/g) || [];
       
-      if (N.length === 0) throw new Error("Nonce tidak valid: " + nonceStr);
+      if (N.length === 0) throw new Error("Nonce tidak memiliki pola \\d+[a-zA-Z]+. Nonce: '" + nonceStr + "'");
 
       for (let i = N.length - 1; i >= 0; i--) {
         const token = N[i];
@@ -132,7 +193,6 @@ export default {
       const b64 = T.join('');
       const cleanStr = b64.replace(/[^A-Za-z0-9+/=]/g, "");
       
-      // Fix padding untuk atob() (Cloudflare sangat ketat soal ini)
       const padLen = (4 - (cleanStr.length % 4)) % 4;
       const paddedStr = cleanStr + "=".repeat(padLen);
       
@@ -152,7 +212,8 @@ export default {
       return jsonResp({
         error: "Gagal decode DATA: " + e.message,
         nonce: nonce,
-        dataSample: dataStr.substring(0, 100)
+        dataSample: dataStr.substring(0, 100),
+        scriptSnippet: targetScript.substring(0, 300)
       }, 500);
     }
 
@@ -182,8 +243,6 @@ function jsonResp(obj, status = 200) {
 
 function safeMathEval(str) {
   str = str.trim();
-  
-  // Handle boolean logic obfuscation (contoh: !!1*5 -> 1*5 -> 5)
   str = str.replace(/!!([0-9.]+)/g, (m, p1) => parseFloat(p1) !== 0 ? '1' : '0');
   str = str.replace(/!([0-9.]+)/g, (m, p1) => parseFloat(p1) !== 0 ? '0' : '1');
   str = str.replace(/!!true/g, '1').replace(/!!false/g, '0');
@@ -240,73 +299,4 @@ function safeMathEval(str) {
   }
   
   return parseExpr();
-}
-
-function evaluateNonceExpression(expr) {
-  let result = '';
-  let i = 0;
-  
-  while (i < expr.length) {
-    if (expr[i] === '"' || expr[i] === "'") {
-      const quote = expr[i];
-      let str = '';
-      i++;
-      while (i < expr.length && expr[i] !== quote) {
-        if (expr[i] === '\\' && i + 1 < expr.length) {
-          i++;
-          if (expr[i] === 'n') str += '\n';
-          else if (expr[i] === 't') str += '\t';
-          else if (expr[i] === 'r') str += '\r';
-          else str += expr[i];
-        } else {
-          str += expr[i];
-        }
-        i++;
-      }
-      i++;
-      result += str;
-    }
-    else if (expr.substring(i, i + 4) === 'eval') {
-      const openParen = expr.indexOf('(', i);
-      if (openParen !== -1) {
-        const quoteEval = expr[openParen + 1];
-        const closeQuote = expr.indexOf(quoteEval, openParen + 2);
-        if (closeQuote !== -1) {
-          const mathStr = expr.substring(openParen + 2, closeQuote);
-          let val = safeMathEval(mathStr);
-          
-          let closeParen = expr.indexOf(')', closeQuote);
-          let endIdx = closeParen + 1;
-          
-          if (expr.substring(endIdx, endIdx + 9) === '.toString') {
-            const openT = expr.indexOf('(', endIdx + 9);
-            if (openT !== -1) {
-              const closeT = expr.indexOf(')', openT + 1);
-              if (closeT !== -1 && closeT > openT + 1) {
-                const radixStr = expr.substring(openT + 1, closeT).trim();
-                const radix = parseInt(radixStr, 10) || 10;
-                val = Math.round(val).toString(radix);
-                endIdx = closeT + 1;
-              } else {
-                val = String(Math.round(val));
-                endIdx = openT + 2;
-              }
-            }
-          } else {
-            val = String(val);
-          }
-          
-          result += val;
-          i = endIdx;
-          continue;
-        }
-      }
-      i++;
-    }
-    else {
-      i++;
-    }
-  }
-  
-  return result;
 }

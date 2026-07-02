@@ -75,66 +75,41 @@ export default {
     }
     if (!dataStr) return jsonResp({ error: "DATA tidak ditemukan di HTML.", url: chapterUrl }, 404);
 
-    // === BULLETPROOF NONCE EXTRACTOR ===
-    // Alih-alih mengevaluasi JS yang rumit, kita langsung mencari string literal di dalam <script> tag
-    let nonce = null;
-    const scriptBlocks = html.match(/<script[^>]*>[\s\S]*?<\/script>/gi) || [];
-    let targetScript = null;
-    
-    for (const script of scriptBlocks) {
-      if (script.includes('DATA') && (script.includes('nonce') || script.includes('nce'))) {
-        targetScript = script;
-        break;
-      }
-    }
-    if (!targetScript) {
-      for (const script of scriptBlocks) {
-        if (script.includes('DATA')) {
-          targetScript = script;
-          break;
-        }
-      }
-    }
-    
-    if (targetScript) {
-      const strings = [];
-      const regex = /(["'])((?:\\.|(?!\1)[^\\])*)\1/g;
+    // === BULLETPROOF NONCE EXTRACTOR (Multi-Assignment Aware) ===
+    const nonceRegexes = [
+      /window\["no"\s*\+\s*"nce"\]\s*=\s*([^;]+);/g,
+      /window\["no"\+"nce"\]\s*=\s*([^;]+);/g,
+      /window\.nonce\s*=\s*([^;]+);/g,
+      /window\["nonce"\]\s*=\s*([^;]+);/g
+    ];
+
+    let matches = [];
+    for (const regex of nonceRegexes) {
       let m;
-      while ((m = regex.exec(targetScript)) !== null) {
-        strings.push(m[2].replace(/\\'/g, "'").replace(/\\"/g, '"').replace(/\\\\/g, '\\'));
-      }
-      
-      // Nonce biasanya panjangnya 32 karakter (MD5) atau sekitar 50-100 karakter.
-      // DATA panjangnya ribuan karakter, jadi kita filter yang < 500 karakter.
-      const candidates = strings.filter(s => 
-        s.length >= 16 && 
-        s.length < 500 && 
-        /^[a-zA-Z0-9]+$/.test(s) &&
-        /\d/.test(s) && 
-        /[a-zA-Z]/.test(s)
-      );
-      
-      if (candidates.length > 0) {
-        nonce = candidates.find(s => (s.match(/\d+[a-zA-Z]+/g) || []).length >= 3) || candidates[0];
+      while ((m = regex.exec(html)) !== null) {
+        matches.push({ index: m.index, expr: m[1].trim() });
       }
     }
 
-    if (!nonce) {
-      const directMatches = [
-        html.match(/window\["no"\s*\+\s*"nce"\]\s*=\s*(?:''\s*\+\s*)?['"]([^'"]{16,})['"]/),
-        html.match(/window\["n"\s*\+\s*"once"\]\s*=\s*(?:''\s*\+\s*)?['"]([^'"]{16,})['"]/),
-        html.match(/window\.nonce\s*=\s*['"]([^'"]{16,})['"]/),
-        html.match(/window\["nonce"\]\s*=\s*['"]([^'"]{16,})['"]/)
-      ];
-      for (const m of directMatches) {
-        if (m && m[1]) {
-          nonce = m[1];
-          break;
+    // Urutkan berdasarkan posisi di HTML dan ambil yang TERAKHIR (karena JS menimpa variabel)
+    matches.sort((a, b) => a.index - b.index);
+    let nonce = null;
+
+    if (matches.length > 0) {
+      for (let i = matches.length - 1; i >= 0; i--) {
+        try {
+          const evaluated = evaluateNonceExpression(matches[i].expr);
+          if (evaluated && evaluated.length >= 16) {
+            nonce = evaluated;
+            break;
+          }
+        } catch (e) {
+          // continue to next match
         }
       }
     }
 
-    if (!nonce) return jsonResp({ error: "NONCE tidak ditemukan.", dataLength: dataStr.length }, 404);
+    if (!nonce) return jsonResp({ error: "NONCE tidak ditemukan atau gagal dievaluasi.", dataLength: dataStr.length }, 404);
 
     // === DECODE DATA ===
     function decodeData(data, nonceStr) {
@@ -157,9 +132,13 @@ export default {
       const b64 = T.join('');
       const cleanStr = b64.replace(/[^A-Za-z0-9+/=]/g, "");
       
-      if (cleanStr.length < 10) throw new Error("Base64 terlalu pendek: " + cleanStr);
+      // Fix padding untuk atob() (Cloudflare sangat ketat soal ini)
+      const padLen = (4 - (cleanStr.length % 4)) % 4;
+      const paddedStr = cleanStr + "=".repeat(padLen);
       
-      const binaryString = atob(cleanStr);
+      if (paddedStr.length < 10) throw new Error("Base64 terlalu pendek: " + paddedStr);
+      
+      const binaryString = atob(paddedStr);
       const bytes = new Uint8Array(binaryString.length);
       for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
       
@@ -199,4 +178,135 @@ export default {
 
 function jsonResp(obj, status = 200) {
   return new Response(JSON.stringify(obj, null, 2), { status, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+}
+
+function safeMathEval(str) {
+  str = str.trim();
+  
+  // Handle boolean logic obfuscation (contoh: !!1*5 -> 1*5 -> 5)
+  str = str.replace(/!!([0-9.]+)/g, (m, p1) => parseFloat(p1) !== 0 ? '1' : '0');
+  str = str.replace(/!([0-9.]+)/g, (m, p1) => parseFloat(p1) !== 0 ? '0' : '1');
+  str = str.replace(/!!true/g, '1').replace(/!!false/g, '0');
+  str = str.replace(/!true/g, '0').replace(/!false/g, '1');
+  str = str.replace(/true/g, '1').replace(/false/g, '0');
+  
+  const tokens = [];
+  let i = 0;
+  while (i < str.length) {
+    if (str[i] === ' ') { i++; continue; }
+    if (/[0-9.]/.test(str[i])) {
+      let num = '';
+      while (i < str.length && /[0-9.]/.test(str[i])) { num += str[i]; i++; }
+      tokens.push({ type: 'NUM', value: parseFloat(num) });
+    } else if ('+-*/()'.includes(str[i])) {
+      tokens.push({ type: 'OP', value: str[i] });
+      i++;
+    } else {
+      i++;
+    }
+  }
+  
+  let pos = 0;
+  function parseExpr() {
+    let node = parseTerm();
+    while (pos < tokens.length && tokens[pos].type === 'OP' && (tokens[pos].value === '+' || tokens[pos].value === '-')) {
+      const op = tokens[pos++].value;
+      const right = parseTerm();
+      node = op === '+' ? node + right : node - right;
+    }
+    return node;
+  }
+  function parseTerm() {
+    let node = parseFactor();
+    while (pos < tokens.length && tokens[pos].type === 'OP' && (tokens[pos].value === '*' || tokens[pos].value === '/')) {
+      const op = tokens[pos++].value;
+      const right = parseFactor();
+      node = op === '*' ? node * right : node / right;
+    }
+    return node;
+  }
+  function parseFactor() {
+    if (pos >= tokens.length) return 0;
+    if (tokens[pos].type === 'OP' && tokens[pos].value === '(') {
+      pos++; const node = parseExpr(); if (tokens[pos] && tokens[pos].value === ')') pos++; return node;
+    }
+    if (tokens[pos].type === 'OP' && tokens[pos].value === '-') {
+      pos++; return -parseFactor();
+    }
+    if (tokens[pos].type === 'OP' && tokens[pos].value === '+') {
+      pos++; return parseFactor();
+    }
+    return tokens[pos++].value;
+  }
+  
+  return parseExpr();
+}
+
+function evaluateNonceExpression(expr) {
+  let result = '';
+  let i = 0;
+  
+  while (i < expr.length) {
+    if (expr[i] === '"' || expr[i] === "'") {
+      const quote = expr[i];
+      let str = '';
+      i++;
+      while (i < expr.length && expr[i] !== quote) {
+        if (expr[i] === '\\' && i + 1 < expr.length) {
+          i++;
+          if (expr[i] === 'n') str += '\n';
+          else if (expr[i] === 't') str += '\t';
+          else if (expr[i] === 'r') str += '\r';
+          else str += expr[i];
+        } else {
+          str += expr[i];
+        }
+        i++;
+      }
+      i++;
+      result += str;
+    }
+    else if (expr.substring(i, i + 4) === 'eval') {
+      const openParen = expr.indexOf('(', i);
+      if (openParen !== -1) {
+        const quoteEval = expr[openParen + 1];
+        const closeQuote = expr.indexOf(quoteEval, openParen + 2);
+        if (closeQuote !== -1) {
+          const mathStr = expr.substring(openParen + 2, closeQuote);
+          let val = safeMathEval(mathStr);
+          
+          let closeParen = expr.indexOf(')', closeQuote);
+          let endIdx = closeParen + 1;
+          
+          if (expr.substring(endIdx, endIdx + 9) === '.toString') {
+            const openT = expr.indexOf('(', endIdx + 9);
+            if (openT !== -1) {
+              const closeT = expr.indexOf(')', openT + 1);
+              if (closeT !== -1 && closeT > openT + 1) {
+                const radixStr = expr.substring(openT + 1, closeT).trim();
+                const radix = parseInt(radixStr, 10) || 10;
+                val = Math.round(val).toString(radix);
+                endIdx = closeT + 1;
+              } else {
+                val = String(Math.round(val));
+                endIdx = openT + 2;
+              }
+            }
+          } else {
+            val = String(val);
+          }
+          
+          result += val;
+          i = endIdx;
+          continue;
+        }
+      }
+      i++;
+    }
+    else {
+      i++;
+    }
+  }
+  
+  return result;
 }

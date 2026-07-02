@@ -225,7 +225,8 @@ export default {
       probeHeaders.set("Referer", successUrl);
 
       const comicImages = [];
-      const MAX_PAGES = 200; // safety ceiling
+      const MAX_PAGES = 300; // safety ceiling (raised to allow scanning past large gaps)
+      const MAX_CONSECUTIVE_MISSES = 40; // some chapters have real gaps in numbering (e.g. 037.jpg then 071.jpg)
       let consecutiveMisses = 0;
 
       for (let n = 1; n <= MAX_PAGES; n++) {
@@ -234,15 +235,15 @@ export default {
         try {
           const headRes = await fetch(imgUrl, { method: "HEAD", headers: probeHeaders, redirect: "follow" });
           if (headRes.ok) {
-            comicImages.push({ url: imgUrl, alt: "" });
+            comicImages.push({ page: n, url: imgUrl, alt: "" });
             consecutiveMisses = 0;
           } else {
             consecutiveMisses++;
-            if (consecutiveMisses >= 2) break;
+            if (consecutiveMisses >= MAX_CONSECUTIVE_MISSES) break;
           }
         } catch (e) {
           consecutiveMisses++;
-          if (consecutiveMisses >= 2) break;
+          if (consecutiveMisses >= MAX_CONSECUTIVE_MISSES) break;
         }
       }
 
@@ -264,8 +265,8 @@ export default {
         chapter_title: chapterTitle,
         page_title: pageTitle,
         total_images: comicImages.length,
-        images: comicImages.map((img, idx) => ({
-          page: idx + 1,
+        images: comicImages.map((img) => ({
+          page: img.page,
           url: img.url,
           alt: img.alt
         }))

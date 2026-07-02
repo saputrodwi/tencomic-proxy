@@ -34,22 +34,18 @@ export default {
         if (m) debugInfo.matched_ids = { comicId: m[1], chapterCid: m[2] };
 
         if (m) {
-          const [, comicId, chapterCid] = m;
-          const pcUrl = `https://ac.qq.com/ComicView/index/id/${comicId}/cid/${chapterCid}`;
-          
           const pageHeaders = new Headers();
           pageHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
           pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
           pageHeaders.set("Referer", "https://ac.qq.com/");
-          
-          const pageRes = await fetch(pcUrl, { method: "GET", headers: pageHeaders, redirect: "follow" });
+          const pageRes = await fetch(u.toString(), { method: "GET", headers: pageHeaders, redirect: "follow" });
           debugInfo.fetch_status = pageRes.status;
           const html = await pageRes.text();
           debugInfo.html_length = html.length;
           
-          // Enhanced regex for debugging detection
-          debugInfo.has_DATA_var = /var\s+DATA\s*=\s*'/.test(html);
-          debugInfo.has_nonce_assignment = /(?:window\[\s*["']n["']\s*\+?\s*["']?once["']?\s*\]|window\[\s*["']no["']\s*\+\s*["']nce["']\s*\]|window\[\s*["']nonce["']\s*\]|window\.nonce)\s*=/.test(html);
+          // Fix: Allow both single/double quotes and flexible declarations
+          debugInfo.has_DATA_var = /(?:var|let|const)?\s*DATA\s*=\s*['"]/.test(html);
+          debugInfo.has_nonce_assignment = /(?:window\[\s*["']n["']\s*\+?\s*["']?once["']?\s*\]|window\[\s*["']no["']\s*\+\s*["']nce["']\s*\]|window\.nonce)\s*=/.test(html);
 
           if (debugInfo.has_DATA_var && debugInfo.has_nonce_assignment) {
             try {
@@ -149,6 +145,7 @@ export default {
     if (jjaptoonMatch) {
       const chapterId = jjaptoonMatch[1];
 
+      // Try the original URL first, if 404 try alternative domains
       const urlsToTry = [
         targetUrl.toString(),
         `https://www.jjaptoon003.com/chapters/${chapterId}`,
@@ -228,7 +225,7 @@ export default {
       probeHeaders.set("Referer", successUrl);
 
       const comicImages = [];
-      const MAX_PAGES = 200;
+      const MAX_PAGES = 200; // safety ceiling
       let consecutiveMisses = 0;
 
       for (let n = 1; n <= MAX_PAGES; n++) {
@@ -289,9 +286,6 @@ export default {
     const acqqMatch = targetUrl.href.match(/ac\.qq\.com\/ComicView\/index\/id\/(\d+)\/cid\/(\d+)/);
     if (acqqMatch) {
       const [, comicId, chapterCid] = acqqMatch;
-      
-      // Mengubah targetUrl menjadi format PC secara paksa untuk menghindari layout mobile yang berbeda
-      const pcUrl = `https://ac.qq.com/ComicView/index/id/${comicId}/cid/${chapterCid}`;
 
       try {
         const pageHeaders = new Headers();
@@ -299,7 +293,7 @@ export default {
         pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
         pageHeaders.set("Referer", "https://ac.qq.com/");
 
-        const pageRes = await fetch(pcUrl, { method: "GET", headers: pageHeaders, redirect: "follow" });
+        const pageRes = await fetch(targetUrl.toString(), { method: "GET", headers: pageHeaders, redirect: "follow" });
         if (!pageRes.ok) {
           throw new Error(`HTTP ${pageRes.status} fetching chapter page`);
         }
@@ -379,22 +373,17 @@ function corsHeaders() {
 }
 
 // ============================================
-// AC.QQ.COM decoder — no eval(), safe for Cloudflare Workers.
+// AC.QQ.COM decoder
 // ============================================
 
 function safeEvalNonceExpr(expr) {
   let e = expr.trim();
-
-  // Penambahan simulasi kondisi environment browser (kerapkali dicari oleh script obfuscator)
   e = e.replace(/!!document\.getElementsByTagName\(['"]html['"]\)/g, "true");
-  e = e.replace(/!!document\.getElementsByTagName\(['"]html['"]\)\[0\]/g, "true");
   e = e.replace(/!window\.Array/g, "false");
   e = e.replace(/!!window\.Array/g, "true");
   e = e.replace(/typeof\s+window\s*!==?\s*['"]undefined['"]/g, "true");
   e = e.replace(/typeof\s+document\s*!==?\s*['"]undefined['"]/g, "true");
-  e = e.replace(/window\.top\s*===?\s*window/g, "true");
 
-  // Math.pow(a,b)
   e = e.replace(/Math\.pow\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)/g,
     (_, a, b) => String(Math.pow(parseFloat(a), parseFloat(b))));
 
@@ -488,9 +477,9 @@ function evalArithmeticBooleanTernary(src) {
   return result;
 }
 
+// FIX: More relaxed regex to handle multiple structures of window.nonce assignments
 function extractNonce(html) {
-  // Regex diperbarui untuk mendeteksi variasi yang lebih luas pada window["nonce"] atau window.nonce
-  const assignRe = /(?:window\[\s*["']n["']\s*\+?\s*["']?once["']?\s*\]|window\[\s*["']no["']\s*\+\s*["']nce["']\s*\]|window\[\s*["']nonce["']\s*\]|window\.nonce)\s*=\s*([^;]+);/g;
+  const assignRe = /(?:window\[\s*["']n["']\s*\+?\s*["']?once["']?\s*\]|window\[\s*["']no["']\s*\+\s*["']nce["']\s*\]|window\.nonce)\s*=\s*([^;\n]+)/g;
   let match;
   let lastExpr = null;
   while ((match = assignRe.exec(html)) !== null) {
@@ -500,9 +489,48 @@ function extractNonce(html) {
   return buildNonceFromExpr(lastExpr);
 }
 
+// FIX: Resolve ternary operations completely securely before parsing strings
 function buildNonceFromExpr(expr) {
-  const pieces = splitTopLevelPlus(expr);
+  let e = expr.trim();
+
+  // Known DOM checks replace
+  e = e.replace(/!!document\.getElementsByTagName\(['"]html['"]\)/g, "true");
+  e = e.replace(/!window\.Array/g, "false");
+  e = e.replace(/!!window\.Array/g, "true");
+  e = e.replace(/typeof\s+window\s*!==?\s*['"]undefined['"]/g, "true");
+  e = e.replace(/typeof\s+document\s*!==?\s*['"]undefined['"]/g, "true");
+  e = e.replace(/window\s*!==?\s*undefined/g, "true");
+  e = e.replace(/document\s*!==?\s*undefined/g, "true");
+
+  // Resolve outermost ternary (true/false ? A : B) natively
+  const ternaryMatch = /^(true|false)\s*\?\s*(.+)$/.exec(e);
+  if (ternaryMatch) {
+    const condition = ternaryMatch[1] === "true";
+    const rest = ternaryMatch[2];
+    let depth = 0;
+    let inStr = null;
+    let colonIdx = -1;
+    for (let i = 0; i < rest.length; i++) {
+      const c = rest[i];
+      if (inStr) {
+        if (c === inStr && rest[i - 1] !== "\\") inStr = null;
+      } else {
+        if (c === "'" || c === '"') inStr = c;
+        else if (c === "(") depth++;
+        else if (c === ")") depth--;
+        else if (c === ":" && depth === 0) { colonIdx = i; break; }
+      }
+    }
+    if (colonIdx !== -1) {
+      const a = rest.substring(0, colonIdx).trim();
+      const b = rest.substring(colonIdx + 1).trim();
+      e = condition ? a : b;
+    }
+  }
+
+  const pieces = splitTopLevelPlus(e);
   let result = "";
+
   for (const piece of pieces) {
     const p = piece.trim();
 
@@ -512,14 +540,17 @@ function buildNonceFromExpr(expr) {
       continue;
     }
 
-    // Mendeteksi format eval(...) terlepas dari pembungkus toString atau konversi angkanya
-    const evalMatch = /eval\(\s*(["'])((?:(?!\1).)*)\1\s*\)/.exec(p);
+    // Capture standard eval execution robustly without outer dependencies
+    const evalMatch = /eval\((["'])((?:(?!\1).)*)\1\)/.exec(p);
     if (evalMatch) {
       const innerExpr = evalMatch[2];
       const value = safeEvalNonceExpr(innerExpr);
-      // Jika kode asli menggunakan + untuk konversi angka sebelum eval, kita terapkan juga.
-      const isPlusCast = p.includes("+eval") || p.includes("+ eval");
-      result += isPlusCast ? String(+value) : String(value);
+      result += String(+value);
+      continue;
+    }
+
+    if (/^\d+$/.test(p)) {
+      result += p;
       continue;
     }
 
@@ -572,10 +603,10 @@ function acQqBase64ToUtf8(b64) {
 }
 
 function decodeAcQqChapterData(html) {
-  // Regex diperbaiki untuk mendukung spasi berlebih pada penugasan variabel DATA
-  const dataMatch = /var\s+DATA\s*=\s*['"]([^'"]+)['"]/.exec(html);
+  // FIX: Make variable regex more resilient to let/const or double quote variances
+  const dataMatch = /(?:var|let|const)?\s*DATA\s*=\s*(['"])(.*?)\1/i.exec(html);
   if (!dataMatch) throw new Error("DATA variable not found in page HTML");
-  const dataRaw = dataMatch[1];
+  const dataRaw = dataMatch[2];
 
   const nonce = extractNonce(html);
   if (!nonce) throw new Error("nonce assignment not found in page HTML");

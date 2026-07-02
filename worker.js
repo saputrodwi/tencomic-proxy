@@ -63,12 +63,12 @@ export default {
     let dataStr = null;
     const dataMatch = html.match(/var\s+DATA\s*=\s*'([\s\S]+?)'/) || 
                       html.match(/var\s+DATA\s*=\s*"([\s\S]+?)"/);
-    if (dataMatch && dataMatch[1].length > 100) {
+    if (dataMatch && dataMatch[1] && dataMatch[1].length > 100) {
       dataStr = dataMatch[1];
     }
     if (!dataStr) return jsonResp({ error: "DATA tidak ditemukan di HTML.", url: chapterUrl }, 404);
 
-    // === BRUTE-FORCE NONCE EXTRACTOR & VALIDATOR ===
+    // === AGGRESSIVE NONCE EXTRACTOR ===
     const candidates = [];
     const seen = new Set();
 
@@ -80,41 +80,31 @@ export default {
       }
     }
 
-    // Priority 1: Explicit nonce assignments (Paling mungkin)
-    const explicitRegexes = [
-      /(?:var\s+nonce|window\["no"\s*\+\s*"nce"\]|window\["nonce"\]|window\.nonce)\s*=\s*['"]([^'"]+)['"]/gi,
+    // Priority 1: Explicit nonce patterns (paling mungkin)
+    const explicitPatterns = [
+      /window\["no"\s*\+\s*"nce"\]\s*=\s*['"]([^'"]+)['"]/gi,
+      /window\["n"\s*\+\s*"once"\]\s*=\s*['"]([^'"]+)['"]/gi,
+      /window\.nonce\s*=\s*['"]([^'"]+)['"]/gi,
+      /window\["nonce"\]\s*=\s*['"]([^'"]+)['"]/gi,
+      /var\s+nonce\s*=\s*['"]([^'"]+)['"]/gi,
       /nonce\s*[:=]\s*['"]([a-zA-Z0-9]{10,100})['"]/gi,
-      /content=['"]([a-zA-Z0-9]{10,100})['"][^>]*nonce/gi
     ];
-    for (const regex of explicitRegexes) {
+    for (const regex of explicitPatterns) {
       let m;
       while ((m = regex.exec(html)) !== null) addCandidate(m[1], 1);
     }
 
-    // Priority 2: Strings in the same script block as DATA
-    const scriptBlocks = html.match(/<script[^>]*>[\s\S]*?<\/script>/gi) || [];
-    let dataScript = null;
-    for (const script of scriptBlocks) {
-      if (/var\s+DATA\s*=/.test(script)) {
-        dataScript = script;
-        break;
-      }
-    }
-    if (dataScript) {
-      const strings = [...dataScript.matchAll(/['"]([a-zA-Z0-9]{10,100})['"]/g)].map(m => m[1]);
-      strings.forEach(s => addCandidate(s, 2));
-    }
+    // Priority 2: Cari semua string alphanumeric 10-100 karakter di SELURUH HTML
+    const allStrings = [...html.matchAll(/['"]([a-zA-Z0-9]{10,100})['"]/g)].map(m => m[1]);
+    allStrings.forEach(s => addCandidate(s, 2));
 
-    // Priority 3: All other script blocks
-    for (const script of scriptBlocks) {
-      if (script === dataScript) continue;
-      const strings = [...script.matchAll(/['"]([a-zA-Z0-9]{10,100})['"]/g)].map(m => m[1]);
-      strings.forEach(s => addCandidate(s, 3));
-    }
+    // Priority 3: Cari string yang mengandung pola \d+[a-zA-Z]+ (karakteristik nonce Tencent)
+    const patternStrings = [...html.matchAll(/['"]([a-zA-Z0-9]*\d+[a-zA-Z]+[a-zA-Z0-9]*)['"]/g)].map(m => m[1]);
+    patternStrings.forEach(s => addCandidate(s, 3));
 
-    // Sort by priority and limit to 50 to avoid CPU timeout di Cloudflare
+    // Sort by priority dan limit ke 200 kandidat
     candidates.sort((a, b) => a.priority - b.priority);
-    const topCandidates = candidates.slice(0, 50).map(c => c.s);
+    const topCandidates = candidates.slice(0, 200).map(c => c.s);
 
     // === TRY DECODE WITH EACH CANDIDATE ===
     function tryDecode(data, nonceStr) {
@@ -137,6 +127,7 @@ export default {
       const cleanStr = b64.replace(/[^A-Za-z0-9+/=]/g, "");
       if (cleanStr.length < 10) return null;
       
+      // Fix padding
       const padLen = (4 - (cleanStr.length % 4)) % 4;
       const paddedStr = cleanStr + "=".repeat(padLen);
       
@@ -145,7 +136,7 @@ export default {
       for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
       
       const text = new TextDecoder('utf-8').decode(bytes);
-      return JSON.parse(text); // Jika ini sukses, berarti nonce BENAR!
+      return JSON.parse(text);
     }
 
     let result = null;
@@ -157,18 +148,19 @@ export default {
         if (decoded && decoded.comic && decoded.picture) {
           result = decoded;
           validNonce = candidate;
-          break; // Berhenti karena sudah menemukan nonce yang valid
+          break;
         }
       } catch (e) {
-        // Kandidat salah, lanjut ke kandidat berikutnya
+        // Kandidat salah, lanjut
       }
     }
 
     if (!result) {
       return jsonResp({ 
-        error: "Gagal decode DATA. Tidak ada kandidat nonce yang valid di HTML.",
+        error: "Gagal decode DATA. Tidak ada kandidat nonce yang valid.",
         candidatesTested: topCandidates.length,
-        topCandidatesSample: topCandidates.slice(0, 5)
+        topCandidatesSample: topCandidates.slice(0, 10),
+        hint: "Coba refresh halaman atau gunakan URL chapter yang berbeda"
       }, 500);
     }
 

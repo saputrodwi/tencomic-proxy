@@ -636,22 +636,24 @@ function splitTopLevelPlus(expr) {
 function cleanAcQqData(dataRaw, nonce) {
   const T = dataRaw.split("");
 
-  // The resolved nonce is a plain decimal digit-string (no letters).
-  // It's chunked into 3-digit groups, each group being an index into
-  // DATA where one junk character was spliced in. Indices must be
-  // removed in descending order so earlier removals don't shift the
-  // positions of indices not yet processed.
-  const digitsOnly = nonce.replace(/\D/g, "");
-  const indices = [];
-  for (let i = 0; i < digitsOnly.length; i += 3) {
-    const chunk = digitsOnly.slice(i, i + 3);
-    if (chunk.length < 3) break; // ignore incomplete trailing chunk
-    indices.push(parseInt(chunk, 10));
-  }
-
-  indices.sort((a, b) => b - a);
-  for (const locate of indices) {
-    T.splice(locate, 1);
+  // nonce here is the fully-resolved value (a hex-like string mixing
+  // digits and letters, e.g. "553a089ee71a1118e2e809dfb35bf504").
+  // Junk substrings were spliced into DATA at positions/lengths encoded
+  // by tokens of the form <digits><letters> found in this string.
+  // Tokens must be removed in the ORIGINAL order returned by the regex,
+  // processed back-to-front (last token first) — do NOT sort by index,
+  // since later (leftward) removals shift positions for tokens that
+  // still need to be processed, and the original algorithm relies on
+  // strictly reverse-array-order processing rather than numeric order.
+  const N = nonce.match(/\d+[a-zA-Z]+/g) || [];
+  let j = N.length;
+  while (j > 0) {
+    j -= 1;
+    const token = N[j];
+    const digits = /^\d+/.exec(token)[0];
+    const letters = token.replace(/\d+/g, "");
+    const locate = parseInt(digits, 10) & 255;
+    T.splice(locate, letters.length);
   }
   return T.join("");
 }

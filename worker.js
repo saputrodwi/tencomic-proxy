@@ -619,13 +619,23 @@ function splitTopLevelPlus(expr) {
 
 function cleanAcQqData(dataRaw, nonce) {
   const T = dataRaw.split("");
-  const N = nonce.match(/\d+[a-zA-Z]+/g) || [];
-  for (let j = N.length - 1; j >= 0; j--) {
-    const m = N[j];
-    const digits = /^\d+/.exec(m)[0];
-    const letters = m.replace(/\d+/g, "");
-    const locate = parseInt(digits, 10) & 255;
-    T.splice(locate, letters.length);
+
+  // The resolved nonce is a plain decimal digit-string (no letters).
+  // It's chunked into 3-digit groups, each group being an index into
+  // DATA where one junk character was spliced in. Indices must be
+  // removed in descending order so earlier removals don't shift the
+  // positions of indices not yet processed.
+  const digitsOnly = nonce.replace(/\D/g, "");
+  const indices = [];
+  for (let i = 0; i < digitsOnly.length; i += 3) {
+    const chunk = digitsOnly.slice(i, i + 3);
+    if (chunk.length < 3) break; // ignore incomplete trailing chunk
+    indices.push(parseInt(chunk, 10));
+  }
+
+  indices.sort((a, b) => b - a);
+  for (const locate of indices) {
+    T.splice(locate, 1);
   }
   return T.join("");
 }

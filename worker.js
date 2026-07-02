@@ -13,6 +13,9 @@ export default {
     const referer = reqUrl.searchParams.get("referer") || reqUrl.searchParams.get("ref") || "";
 
     // TEMPORARY DEBUG ENDPOINT — remove after diagnosing the acqq issue.
+    // Visit /?debug=acqq&url=<encoded chapter URL> to see exactly what's
+    // happening: whether the regex matches, whether DATA/nonce are found,
+    // and the raw decode error if any — without needing eval() or guessing.
     if (reqUrl.searchParams.get("debug") === "acqq" && target) {
       let decodedForDebug = target;
       for (let i = 0; i < 3; i++) {
@@ -26,21 +29,27 @@ export default {
       try {
         const u = new URL(decodedForDebug);
         debugInfo.parsed_href = u.href;
-        const m = u.href.match(/ac\.qq\.com\/ComicView\/index\/id\/(\d+)\/cid\/(\d+)/i);
+        const m = u.href.match(/ac\.qq\.com\/ComicView\/index\/id\/(\d+)\/cid\/(\d+)/);
         debugInfo.regex_matched = !!m;
         if (m) debugInfo.matched_ids = { comicId: m[1], chapterCid: m[2] };
 
         if (m) {
+          const [, comicId, chapterCid] = m;
+          const pcUrl = `https://ac.qq.com/ComicView/index/id/${comicId}/cid/${chapterCid}`;
+          
           const pageHeaders = new Headers();
-          pageHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
+          pageHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
           pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
           pageHeaders.set("Referer", "https://ac.qq.com/");
-          const pageRes = await fetch(u.toString(), { method: "GET", headers: pageHeaders, redirect: "follow" });
+          
+          const pageRes = await fetch(pcUrl, { method: "GET", headers: pageHeaders, redirect: "follow" });
           debugInfo.fetch_status = pageRes.status;
           const html = await pageRes.text();
           debugInfo.html_length = html.length;
-          debugInfo.has_DATA_var = /(?:var\s+|window\.)?DATA\s*=\s*(['"])([\s\S]*?)\1/.test(html);
-          debugInfo.has_nonce_assignment = extractNonce(html) !== null;
+          
+          // Enhanced regex for debugging detection
+          debugInfo.has_DATA_var = /var\s+DATA\s*=\s*'/.test(html);
+          debugInfo.has_nonce_assignment = /(?:window\[\s*["']n["']\s*\+?\s*["']?once["']?\s*\]|window\[\s*["']no["']\s*\+\s*["']nce["']\s*\]|window\[\s*["']nonce["']\s*\]|window\.nonce)\s*=/.test(html);
 
           if (debugInfo.has_DATA_var && debugInfo.has_nonce_assignment) {
             try {
@@ -99,7 +108,7 @@ export default {
     // ============================================
     // KUAIKAN MANHUA - Support multiple URL patterns
     // ============================================
-    const kuaikanMatch = targetUrl.href.match(/kuaikanmanhua\.com\/.*?(\d{5,})/i);
+    const kuaikanMatch = targetUrl.href.match(/kuaikanmanhua\.com\/.*?(\d{5,})/);
     if (kuaikanMatch) {
       const chapterId = kuaikanMatch[1];
 
@@ -136,7 +145,7 @@ export default {
     // ============================================
     // JJAPTOON - Support multiple domains + try with redirect
     // ============================================
-    const jjaptoonMatch = targetUrl.href.match(/^https?:\/\/[^/]*jjaptoon[^/]*\/chapters\/(\d+)/i);
+    const jjaptoonMatch = targetUrl.href.match(/^https?:\/\/[^/]*jjaptoon[^/]*\/chapters\/(\d+)/);
     if (jjaptoonMatch) {
       const chapterId = jjaptoonMatch[1];
 
@@ -153,7 +162,7 @@ export default {
       for (const url of urlsToTry) {
         try {
           const pageHeaders = new Headers();
-          pageHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
+          pageHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
           pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
           pageHeaders.set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7");
           pageHeaders.set("Referer", new URL(url).origin + "/");
@@ -214,40 +223,20 @@ export default {
       const encodedFolder = folderPath.split("/").map(encodeURIComponent).join("/");
       const baseImageUrl = `https://www.jjaptoon003.com/storage/comics-imported/${encodedFolder}/`;
 
+      const probeHeaders = new Headers();
+      probeHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
+      probeHeaders.set("Referer", successUrl);
+
       const comicImages = [];
-      const MAX_PAGES = 200; 
+      const MAX_PAGES = 200;
       let consecutiveMisses = 0;
 
       for (let n = 1; n <= MAX_PAGES; n++) {
         const pageNum = String(n).padStart(3, "0");
         const imgUrl = `${baseImageUrl}${pageNum}.jpg`;
         try {
-          const probeHeaders = new Headers();
-          probeHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
-          probeHeaders.set("Referer", successUrl);
-
-          // Cek dengan HEAD, bila di-blok oleh CDN (status 403/405), fallback pakai GET dengan header Range (hanya meminta 1 byte pertama)
-          let isOk = false;
-          try {
-            const headRes = await fetch(imgUrl, { method: "HEAD", headers: probeHeaders, redirect: "follow" });
-            if (headRes.ok) {
-              isOk = true;
-            } else if (headRes.status === 405 || headRes.status === 403) {
-              probeHeaders.set("Range", "bytes=0-0");
-              const getRes = await fetch(imgUrl, { method: "GET", headers: probeHeaders, redirect: "follow" });
-              if (getRes.status === 200 || getRes.status === 206) {
-                isOk = true;
-              }
-            }
-          } catch {
-            probeHeaders.set("Range", "bytes=0-0");
-            const getRes = await fetch(imgUrl, { method: "GET", headers: probeHeaders, redirect: "follow" });
-            if (getRes.status === 200 || getRes.status === 206) {
-              isOk = true;
-            }
-          }
-
-          if (isOk) {
+          const headRes = await fetch(imgUrl, { method: "HEAD", headers: probeHeaders, redirect: "follow" });
+          if (headRes.ok) {
             comicImages.push({ url: imgUrl, alt: "" });
             consecutiveMisses = 0;
           } else {
@@ -297,17 +286,20 @@ export default {
     // ============================================
     // AC.QQ.COM - Free chapters, requires custom deobfuscation
     // ============================================
-    const acqqMatch = targetUrl.href.match(/ac\.qq\.com\/ComicView\/index\/id\/(\d+)\/cid\/(\d+)/i);
+    const acqqMatch = targetUrl.href.match(/ac\.qq\.com\/ComicView\/index\/id\/(\d+)\/cid\/(\d+)/);
     if (acqqMatch) {
       const [, comicId, chapterCid] = acqqMatch;
+      
+      // Mengubah targetUrl menjadi format PC secara paksa untuk menghindari layout mobile yang berbeda
+      const pcUrl = `https://ac.qq.com/ComicView/index/id/${comicId}/cid/${chapterCid}`;
 
       try {
         const pageHeaders = new Headers();
-        pageHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
+        pageHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
         pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
         pageHeaders.set("Referer", "https://ac.qq.com/");
 
-        const pageRes = await fetch(targetUrl.toString(), { method: "GET", headers: pageHeaders, redirect: "follow" });
+        const pageRes = await fetch(pcUrl, { method: "GET", headers: pageHeaders, redirect: "follow" });
         if (!pageRes.ok) {
           throw new Error(`HTTP ${pageRes.status} fetching chapter page`);
         }
@@ -349,14 +341,14 @@ export default {
       }
     }
 
-    // Fallback proxy (Untuk pemuatan asset / bypass CORS gambar)
+    // Fallback proxy
     let effectiveReferer = targetUrl.origin + "/";
     let effectiveOrigin = targetUrl.origin;
     if (referer) { try { const r = new URL(referer); effectiveReferer = referer; effectiveOrigin = r.origin; } catch {} }
 
     const headers = new Headers();
-    headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
-    headers.set("Accept", "text/html,image/*,*/*;q=0.8");
+    headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+    headers.set("Accept", "text/html,*/*;q=0.8");
     headers.set("Referer", effectiveReferer);
     headers.set("Origin", effectiveOrigin);
 
@@ -368,14 +360,7 @@ export default {
       responseHeaders.set("Access-Control-Allow-Headers", "*");
       responseHeaders.set("Cross-Origin-Resource-Policy", "cross-origin");
       responseHeaders.delete("content-security-policy");
-      responseHeaders.delete("content-security-policy-report-only");
       responseHeaders.delete("x-frame-options");
-
-      // PENTING: Hapus content-encoding dan content-length agar browser tidak mengalami error ERR_CONTENT_DECODING_FAILED 
-      // ketika Cloudflare Workers otomatis mendekompresi konten gambarnya.
-      responseHeaders.delete("content-encoding");
-      responseHeaders.delete("content-length");
-
       return new Response(response.body, { status: response.status, statusText: response.statusText, headers: responseHeaders });
     } catch (error) {
       return new Response("Proxy error: " + error.message, { status: 502, headers: corsHeaders() });
@@ -393,29 +378,31 @@ function corsHeaders() {
   };
 }
 
+// ============================================
+// AC.QQ.COM decoder — no eval(), safe for Cloudflare Workers.
+// ============================================
+
 function safeEvalNonceExpr(expr) {
   let e = expr.trim();
 
-  // Bersihkan dari variabel browser yang sering digunakan web sebagai pengecekan.
+  // Penambahan simulasi kondisi environment browser (kerapkali dicari oleh script obfuscator)
   e = e.replace(/!!document\.getElementsByTagName\(['"]html['"]\)/g, "true");
+  e = e.replace(/!!document\.getElementsByTagName\(['"]html['"]\)\[0\]/g, "true");
   e = e.replace(/!window\.Array/g, "false");
   e = e.replace(/!!window\.Array/g, "true");
   e = e.replace(/typeof\s+window\s*!==?\s*['"]undefined['"]/g, "true");
   e = e.replace(/typeof\s+document\s*!==?\s*['"]undefined['"]/g, "true");
+  e = e.replace(/window\.top\s*===?\s*window/g, "true");
 
+  // Math.pow(a,b)
   e = e.replace(/Math\.pow\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)/g,
     (_, a, b) => String(Math.pow(parseFloat(a), parseFloat(b))));
 
-  try {
-    // Evaluasi ekspresi aritmatika murni dengan new Function()
-    return new Function(`return (${e})`)();
-  } catch (err) {
-    // Fallback ke parser matematika bawaan apabila dilarang oleh server worker Anda
-    if (!/^[\d\s+\-*/%().<>=!?:truefalse]+$/i.test(e)) {
-      throw new Error("Unrecognized nonce expression pattern: " + expr);
-    }
-    return evalArithmeticBooleanTernary(e);
+  if (!/^[\d\s+\-*/%().<>=!?:truefalse]+$/i.test(e)) {
+    throw new Error("Unrecognized nonce expression pattern: " + expr);
   }
+
+  return evalArithmeticBooleanTernary(e);
 }
 
 function evalArithmeticBooleanTernary(src) {
@@ -502,27 +489,15 @@ function evalArithmeticBooleanTernary(src) {
 }
 
 function extractNonce(html) {
-  const patterns = [
-    /window\[\s*["']n["']\s*\+\s*["']once["']\s*\]\s*=\s*([^;\n<]+)/,
-    /window\[\s*["']no["']\s*\+\s*["']nce["']\s*\]\s*=\s*([^;\n<]+)/,
-    /window\[\s*["']nonce["']\s*\]\s*=\s*([^;\n<]+)/,
-    /window\.nonce\s*=\s*([^;\n<]+)/,
-    /var\s+nonce\s*=\s*([^;\n<]+)/
-  ];
-
-  for (const pattern of patterns) {
-    const match = pattern.exec(html);
-    if (match) {
-      try {
-        const expr = match[1];
-        const built = buildNonceFromExpr(expr);
-        if (built) return built;
-      } catch (e) {
-        continue;
-      }
-    }
+  // Regex diperbarui untuk mendeteksi variasi yang lebih luas pada window["nonce"] atau window.nonce
+  const assignRe = /(?:window\[\s*["']n["']\s*\+?\s*["']?once["']?\s*\]|window\[\s*["']no["']\s*\+\s*["']nce["']\s*\]|window\[\s*["']nonce["']\s*\]|window\.nonce)\s*=\s*([^;]+);/g;
+  let match;
+  let lastExpr = null;
+  while ((match = assignRe.exec(html)) !== null) {
+    lastExpr = match[1];
   }
-  return null;
+  if (!lastExpr) return null;
+  return buildNonceFromExpr(lastExpr);
 }
 
 function buildNonceFromExpr(expr) {
@@ -537,24 +512,16 @@ function buildNonceFromExpr(expr) {
       continue;
     }
 
-    const evalMatch = /^\(\s*\+\s*eval\(\s*(["'])((?:(?!\1).)*)\1\s*\)\s*\)\s*\.\s*toString\(\s*\)$/.exec(p);
+    // Mendeteksi format eval(...) terlepas dari pembungkus toString atau konversi angkanya
+    const evalMatch = /eval\(\s*(["'])((?:(?!\1).)*)\1\s*\)/.exec(p);
     if (evalMatch) {
       const innerExpr = evalMatch[2];
       const value = safeEvalNonceExpr(innerExpr);
-      result += String(+value);
+      // Jika kode asli menggunakan + untuk konversi angka sebelum eval, kita terapkan juga.
+      const isPlusCast = p.includes("+eval") || p.includes("+ eval");
+      result += isPlusCast ? String(+value) : String(value);
       continue;
     }
-
-    if (/^\d+$/.test(p)) {
-      result += p;
-      continue;
-    }
-
-    try {
-      const val = safeEvalNonceExpr(p);
-      result += String(val);
-      continue;
-    } catch (err) {}
 
     throw new Error("Unrecognized nonce piece: " + p);
   }
@@ -585,7 +552,7 @@ function splitTopLevelPlus(expr) {
 
 function cleanAcQqData(dataRaw, nonce) {
   const T = dataRaw.split("");
-  const N = (nonce && typeof nonce === "string") ? (nonce.match(/\d+[a-zA-Z]+/g) || []) : [];
+  const N = nonce.match(/\d+[a-zA-Z]+/g) || [];
   for (let j = N.length - 1; j >= 0; j--) {
     const m = N[j];
     const digits = /^\d+/.exec(m)[0];
@@ -605,9 +572,10 @@ function acQqBase64ToUtf8(b64) {
 }
 
 function decodeAcQqChapterData(html) {
-  const dataMatch = /(?:var\s+|window\.)?DATA\s*=\s*(['"])([\s\S]*?)\1/.exec(html);
+  // Regex diperbaiki untuk mendukung spasi berlebih pada penugasan variabel DATA
+  const dataMatch = /var\s+DATA\s*=\s*['"]([^'"]+)['"]/.exec(html);
   if (!dataMatch) throw new Error("DATA variable not found in page HTML");
-  const dataRaw = dataMatch[2];
+  const dataRaw = dataMatch[1];
 
   const nonce = extractNonce(html);
   if (!nonce) throw new Error("nonce assignment not found in page HTML");

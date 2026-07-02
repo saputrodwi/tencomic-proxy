@@ -224,27 +224,62 @@ export default {
       probeHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
       probeHeaders.set("Referer", successUrl);
 
-      const comicImages = [];
-      const MAX_PAGES = 300; // safety ceiling (raised to allow scanning past large gaps)
-      const MAX_CONSECUTIVE_MISSES = 40; // some chapters have real gaps in numbering (e.g. 037.jpg then 071.jpg)
-      let consecutiveMisses = 0;
-
-      for (let n = 1; n <= MAX_PAGES; n++) {
+      async function pageExists(n) {
         const pageNum = String(n).padStart(3, "0");
         const imgUrl = `${baseImageUrl}${pageNum}.jpg`;
         try {
-          const headRes = await fetch(imgUrl, { method: "HEAD", headers: probeHeaders, redirect: "follow" });
-          if (headRes.ok) {
-            comicImages.push({ page: n, url: imgUrl, alt: "" });
-            consecutiveMisses = 0;
-          } else {
-            consecutiveMisses++;
-            if (consecutiveMisses >= MAX_CONSECUTIVE_MISSES) break;
-          }
+          const res = await fetch(imgUrl, { method: "HEAD", headers: probeHeaders, redirect: "follow" });
+          return { ok: res.ok, url: imgUrl };
         } catch (e) {
-          consecutiveMisses++;
-          if (consecutiveMisses >= MAX_CONSECUTIVE_MISSES) break;
+          return { ok: false, url: imgUrl };
         }
+      }
+
+      // Cloudflare Workers on the Free plan allow only 50 subrequests per
+      // invocation. A naive 1-request-per-page linear probe runs out of
+      // budget on chapters longer than ~45 pages (the request that would
+      // confirm page N silently fails once the budget is exhausted, which
+      // looks exactly like "page N doesn't exist" — undercounting long
+      // chapters). To stay well under the budget regardless of chapter
+      // length, binary-search for the highest page number that exists
+      // (~9 requests covers up to 300 pages), then generate the full
+      // 1..N URL list directly instead of probing every page individually.
+      //
+      // Trade-off: most jjaptoon chapters are numbered contiguously, but a
+      // few have real gaps in the middle (e.g. 037.jpg then 071.jpg with
+      // nothing in between). Skipping the per-page scan means a gap like
+      // that isn't detected here — the missing URLs are still included in
+      // the list, and will simply fail individually at actual download time
+      // (reported as "failed" in the log) rather than corrupting the whole
+      // chapter fetch or silently truncating a long, gap-free chapter.
+      const HARD_MAX_PAGE = 300;
+
+      let lo = 1, hi = HARD_MAX_PAGE;
+      let highestKnownGood = 0;
+      let searchCalls = 0;
+
+      const first = await pageExists(1);
+      searchCalls++;
+      if (first.ok) {
+        highestKnownGood = 1;
+        while (lo <= hi && searchCalls < 12) {
+          const mid = Math.floor((lo + hi) / 2);
+          if (mid === 0) break;
+          const r = await pageExists(mid);
+          searchCalls++;
+          if (r.ok) {
+            highestKnownGood = Math.max(highestKnownGood, mid);
+            lo = mid + 1;
+          } else {
+            hi = mid - 1;
+          }
+        }
+      }
+
+      const comicImages = [];
+      for (let n = 1; n <= highestKnownGood; n++) {
+        const pageNum = String(n).padStart(3, "0");
+        comicImages.push({ page: n, url: `${baseImageUrl}${pageNum}.jpg`, alt: "" });
       }
 
       if (comicImages.length === 0) {

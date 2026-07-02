@@ -59,126 +59,69 @@ export default {
       return jsonResp({ error: "Gagal ambil HTML: " + e.message }, 500);
     }
 
-    // === CARI DATA DAN NONCE DI DALAM SCRIPT BLOCK YANG SAMA ===
-    const scriptBlocks = html.match(/<script[^>]*>[\s\S]*?<\/script>/gi) || [];
-    
+    // === EXTRACT DATA ===
     let dataStr = null;
-    let targetScript = null;
+    const dataMatch = html.match(/var\s+DATA\s*=\s*'([\s\S]+?)'/) || 
+                      html.match(/var\s+DATA\s*=\s*"([\s\S]+?)"/);
+    if (dataMatch && dataMatch[1].length > 100) {
+      dataStr = dataMatch[1];
+    }
+    if (!dataStr) return jsonResp({ error: "DATA tidak ditemukan di HTML.", url: chapterUrl }, 404);
 
-    for (const script of scriptBlocks) {
-      if (/var\s+DATA\s*=|window\.DATA\s*=|window\["DATA"\]\s*=/.test(script)) {
-        const dataMatch = script.match(/var\s+DATA\s*=\s*'([\s\S]+?)'/) ||
-                          script.match(/var\s+DATA\s*=\s*"([\s\S]+?)"/) ||
-                          script.match(/window\.DATA\s*=\s*"([\s\S]+?)"/) ||
-                          script.match(/window\["DATA"\]\s*=\s*"([\s\S]+?)"/);
-        if (dataMatch && dataMatch[1] && dataMatch[1].length > 100) {
-          dataStr = dataMatch[1];
-          targetScript = script;
-          break;
-        }
+    // === BRUTE-FORCE NONCE EXTRACTOR & VALIDATOR ===
+    const candidates = [];
+    const seen = new Set();
+
+    function addCandidate(s, priority) {
+      // Filter: panjang 10-100, mengandung angka dan huruf
+      if (s && !seen.has(s) && s.length >= 10 && s.length <= 100 && /\d/.test(s) && /[a-zA-Z]/.test(s)) {
+        seen.add(s);
+        candidates.push({ s, priority });
       }
     }
 
-    if (!dataStr || !targetScript) return jsonResp({ error: "DATA tidak ditemukan di HTML.", url: chapterUrl }, 404);
-
-    // === EKSTRAK NONCE DARI TARGET SCRIPT ===
-    let nonce = null;
-
-    // Strategi 1: Cari string literal langsung
-    const directPatterns = [
-      /window\["no"\s*\+\s*"nce"\]\s*=\s*['"]([^'"]+)['"]/,
-      /window\["nonce"\]\s*=\s*['"]([^'"]+)['"]/,
-      /window\.nonce\s*=\s*['"]([^'"]+)['"]/,
-      /var\s+nonce\s*=\s*['"]([^'"]+)['"]/,
-      /nonce\s*=\s*['"]([^'"]+)['"]/
+    // Priority 1: Explicit nonce assignments (Paling mungkin)
+    const explicitRegexes = [
+      /(?:var\s+nonce|window\["no"\s*\+\s*"nce"\]|window\["nonce"\]|window\.nonce)\s*=\s*['"]([^'"]+)['"]/gi,
+      /nonce\s*[:=]\s*['"]([a-zA-Z0-9]{10,100})['"]/gi,
+      /content=['"]([a-zA-Z0-9]{10,100})['"][^>]*nonce/gi
     ];
+    for (const regex of explicitRegexes) {
+      let m;
+      while ((m = regex.exec(html)) !== null) addCandidate(m[1], 1);
+    }
 
-    for (const pattern of directPatterns) {
-      const m = targetScript.match(pattern);
-      if (m && m[1] && m[1].length >= 16) {
-        nonce = m[1];
+    // Priority 2: Strings in the same script block as DATA
+    const scriptBlocks = html.match(/<script[^>]*>[\s\S]*?<\/script>/gi) || [];
+    let dataScript = null;
+    for (const script of scriptBlocks) {
+      if (/var\s+DATA\s*=/.test(script)) {
+        dataScript = script;
         break;
       }
     }
-
-    // Strategi 2: Jika ada expression dengan eval() atau concatenation
-    if (!nonce) {
-      const exprPatterns = [
-        /window\["no"\s*\+\s*"nce"\]\s*=\s*([^;]+);/,
-        /window\["nonce"\]\s*=\s*([^;]+);/,
-        /window\.nonce\s*=\s*([^;]+);/,
-        /var\s+nonce\s*=\s*([^;]+);/,
-        /nonce\s*=\s*([^;]+);/
-      ];
-
-      for (const pattern of exprPatterns) {
-        const m = targetScript.match(pattern);
-        if (m && m[1]) {
-          const expr = m[1].trim();
-          
-          const stringMatches = [...expr.matchAll(/(['"])((?:\\.|(?!\1)[^\\])*)\1/g)];
-          const strings = stringMatches.map(match => match[2].replace(/\\'/g, "'").replace(/\\"/g, '"').replace(/\\\\/g, '\\'));
-          
-          const evalMatch = expr.match(/eval\s*\(\s*['"]([^'"]+)['"]\s*\)/);
-          let evalResult = '';
-          if (evalMatch) {
-            try {
-              let val = safeMathEval(evalMatch[1]);
-              const radixMatch = expr.match(/\.toString\s*\(\s*(\d+)\s*\)/);
-              if (radixMatch) {
-                const radix = parseInt(radixMatch[1], 10);
-                evalResult = Math.round(val).toString(radix);
-              } else {
-                evalResult = String(val);
-              }
-            } catch (e) {}
-          }
-          
-          if (strings.length > 0) {
-            const mainStrings = strings.filter(s => s.length > 3 && s !== evalMatch?.[1]);
-            if (mainStrings.length >= 2 && evalResult) {
-              nonce = mainStrings[0] + evalResult + mainStrings[1];
-            } else if (mainStrings.length === 1 && evalResult) {
-              nonce = mainStrings[0] + evalResult;
-            } else if (mainStrings.length > 0) {
-              nonce = mainStrings.join('');
-            }
-          }
-          
-          if (nonce && nonce.length >= 16) break;
-        }
-      }
+    if (dataScript) {
+      const strings = [...dataScript.matchAll(/['"]([a-zA-Z0-9]{10,100})['"]/g)].map(m => m[1]);
+      strings.forEach(s => addCandidate(s, 2));
     }
 
-    // Strategi 3: Fallback - cari MD5 hash (32 hex chars) di targetScript
-    if (!nonce) {
-      const md5Match = targetScript.match(/['"]([a-f0-9]{32})['"]/i);
-      if (md5Match) nonce = md5Match[1];
+    // Priority 3: All other script blocks
+    for (const script of scriptBlocks) {
+      if (script === dataScript) continue;
+      const strings = [...script.matchAll(/['"]([a-zA-Z0-9]{10,100})['"]/g)].map(m => m[1]);
+      strings.forEach(s => addCandidate(s, 3));
     }
 
-    // Strategi 4: Fallback - cari string alphanumeric 16-100 chars dengan pola \d+[a-zA-Z]+
-    if (!nonce) {
-      const allStrings = [...targetScript.matchAll(/['"]([a-zA-Z0-9]{16,100})['"]/g)].map(m => m[1]);
-      for (const s of allStrings) {
-        if (/\d+[a-zA-Z]+/.test(s) && (s.match(/\d+[a-zA-Z]+/g) || []).length >= 3) {
-          nonce = s;
-          break;
-        }
-      }
-    }
+    // Sort by priority and limit to 50 to avoid CPU timeout di Cloudflare
+    candidates.sort((a, b) => a.priority - b.priority);
+    const topCandidates = candidates.slice(0, 50).map(c => c.s);
 
-    if (!nonce) return jsonResp({ 
-      error: "NONCE tidak ditemukan di dalam script block DATA.",
-      scriptSnippet: targetScript.substring(0, 500)
-    }, 404);
-
-    // === DECODE DATA ===
-    function decodeData(data, nonceStr) {
+    // === TRY DECODE WITH EACH CANDIDATE ===
+    function tryDecode(data, nonceStr) {
       const T = data.split('');
       const N = nonceStr.match(/\d+[a-zA-Z]+/g) || [];
+      if (N.length === 0) return null;
       
-      if (N.length === 0) throw new Error("Nonce tidak memiliki pola \\d+[a-zA-Z]+. Nonce: '" + nonceStr + "'");
-
       for (let i = N.length - 1; i >= 0; i--) {
         const token = N[i];
         const numMatch = token.match(/^(\d+)/);
@@ -192,28 +135,40 @@ export default {
       
       const b64 = T.join('');
       const cleanStr = b64.replace(/[^A-Za-z0-9+/=]/g, "");
+      if (cleanStr.length < 10) return null;
       
       const padLen = (4 - (cleanStr.length % 4)) % 4;
       const paddedStr = cleanStr + "=".repeat(padLen);
-      
-      if (paddedStr.length < 10) throw new Error("Base64 terlalu pendek: " + paddedStr);
       
       const binaryString = atob(paddedStr);
       const bytes = new Uint8Array(binaryString.length);
       for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
       
-      return JSON.parse(new TextDecoder('utf-8').decode(bytes));
+      const text = new TextDecoder('utf-8').decode(bytes);
+      return JSON.parse(text); // Jika ini sukses, berarti nonce BENAR!
     }
 
-    let result;
-    try {
-      result = decodeData(dataStr, nonce);
-    } catch (e) {
-      return jsonResp({
-        error: "Gagal decode DATA: " + e.message,
-        nonce: nonce,
-        dataSample: dataStr.substring(0, 100),
-        scriptSnippet: targetScript.substring(0, 300)
+    let result = null;
+    let validNonce = null;
+
+    for (const candidate of topCandidates) {
+      try {
+        const decoded = tryDecode(dataStr, candidate);
+        if (decoded && decoded.comic && decoded.picture) {
+          result = decoded;
+          validNonce = candidate;
+          break; // Berhenti karena sudah menemukan nonce yang valid
+        }
+      } catch (e) {
+        // Kandidat salah, lanjut ke kandidat berikutnya
+      }
+    }
+
+    if (!result) {
+      return jsonResp({ 
+        error: "Gagal decode DATA. Tidak ada kandidat nonce yang valid di HTML.",
+        candidatesTested: topCandidates.length,
+        topCandidatesSample: topCandidates.slice(0, 5)
       }, 500);
     }
 
@@ -239,64 +194,4 @@ export default {
 
 function jsonResp(obj, status = 200) {
   return new Response(JSON.stringify(obj, null, 2), { status, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
-}
-
-function safeMathEval(str) {
-  str = str.trim();
-  str = str.replace(/!!([0-9.]+)/g, (m, p1) => parseFloat(p1) !== 0 ? '1' : '0');
-  str = str.replace(/!([0-9.]+)/g, (m, p1) => parseFloat(p1) !== 0 ? '0' : '1');
-  str = str.replace(/!!true/g, '1').replace(/!!false/g, '0');
-  str = str.replace(/!true/g, '0').replace(/!false/g, '1');
-  str = str.replace(/true/g, '1').replace(/false/g, '0');
-  
-  const tokens = [];
-  let i = 0;
-  while (i < str.length) {
-    if (str[i] === ' ') { i++; continue; }
-    if (/[0-9.]/.test(str[i])) {
-      let num = '';
-      while (i < str.length && /[0-9.]/.test(str[i])) { num += str[i]; i++; }
-      tokens.push({ type: 'NUM', value: parseFloat(num) });
-    } else if ('+-*/()'.includes(str[i])) {
-      tokens.push({ type: 'OP', value: str[i] });
-      i++;
-    } else {
-      i++;
-    }
-  }
-  
-  let pos = 0;
-  function parseExpr() {
-    let node = parseTerm();
-    while (pos < tokens.length && tokens[pos].type === 'OP' && (tokens[pos].value === '+' || tokens[pos].value === '-')) {
-      const op = tokens[pos++].value;
-      const right = parseTerm();
-      node = op === '+' ? node + right : node - right;
-    }
-    return node;
-  }
-  function parseTerm() {
-    let node = parseFactor();
-    while (pos < tokens.length && tokens[pos].type === 'OP' && (tokens[pos].value === '*' || tokens[pos].value === '/')) {
-      const op = tokens[pos++].value;
-      const right = parseFactor();
-      node = op === '*' ? node * right : node / right;
-    }
-    return node;
-  }
-  function parseFactor() {
-    if (pos >= tokens.length) return 0;
-    if (tokens[pos].type === 'OP' && tokens[pos].value === '(') {
-      pos++; const node = parseExpr(); if (tokens[pos] && tokens[pos].value === ')') pos++; return node;
-    }
-    if (tokens[pos].type === 'OP' && tokens[pos].value === '-') {
-      pos++; return -parseFactor();
-    }
-    if (tokens[pos].type === 'OP' && tokens[pos].value === '+') {
-      pos++; return parseFactor();
-    }
-    return tokens[pos++].value;
-  }
-  
-  return parseExpr();
 }

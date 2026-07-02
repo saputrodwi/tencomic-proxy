@@ -1,321 +1,279 @@
 export default {
   async fetch(request) {
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, OPTIONS",
-          "Access-Control-Allow-Headers": "*",
-        },
-      });
-    }
-    
-    const url = new URL(request.url);
+    const reqUrl = new URL(request.url);
 
-    if (url.pathname === "/img") {
-      const imageUrl = url.searchParams.get("url");
-      if (!imageUrl) return jsonResp({ error: "Parameter 'url' wajib diisi" }, 400);
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders() });
+    }
+    if (request.method === "HEAD") {
+      return new Response(null, { status: 200, headers: corsHeaders() });
+    }
+
+    const target = reqUrl.searchParams.get("url") || reqUrl.searchParams.get("u");
+    const referer = reqUrl.searchParams.get("referer") || reqUrl.searchParams.get("ref") || "";
+
+    if (!target) {
+      return new Response("Missing ?url=", { status: 400, headers: corsHeaders() });
+    }
+
+    let decodedTarget = target;
+    for (let i = 0; i < 3; i++) {
       try {
-        const imgRes = await fetch(imageUrl, {
-          headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-            "Referer": "https://ac.qq.com/",
-          },
-        });
-        const buf = await imgRes.arrayBuffer();
-        return new Response(buf, {
-          status: imgRes.status,
-          headers: {
-            "Content-Type": imgRes.headers.get("Content-Type") || "image/jpeg",
-            "Access-Control-Allow-Origin": "*",
-            "Cache-Control": "public, max-age=31536000, immutable",
-          },
-        });
-      } catch (e) {
-        return jsonResp({ error: "Gagal fetch gambar: " + e.message }, 502);
+        const newDecoded = decodeURIComponent(decodedTarget);
+        if (newDecoded === decodedTarget) break;
+        decodedTarget = newDecoded;
+      } catch { break; }
+    }
+
+    let targetUrl;
+    try {
+      targetUrl = new URL(decodedTarget);
+    } catch {
+      return new Response("Invalid URL: " + decodedTarget.substring(0, 100), { status: 400, headers: corsHeaders() });
+    }
+
+    if (!["http:", "https:"].includes(targetUrl.protocol)) {
+      return new Response("Only http/https", { status: 400, headers: corsHeaders() });
+    }
+
+    // SSRF protection
+    const hostname = targetUrl.hostname.toLowerCase();
+    if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "0.0.0.0" || hostname === "::1" ||
+        /^10\./.test(hostname) || /^192\.168\./.test(hostname) || /^172\.(1[6-9]|2\d|3[01])\./.test(hostname) ||
+        hostname.endsWith(".internal") || hostname.endsWith(".local")) {
+      return new Response("Forbidden", { status: 403, headers: corsHeaders() });
+    }
+
+    // ============================================
+    // KUAIKAN MANHUA - Support multiple URL patterns
+    // ============================================
+    // Both of these are chapter (comic) ids, just different routes/domains:
+    // Pattern 1: m.kuaikanmanhua.com/mobile/comics/{id}
+    // Pattern 2: www.kuaikanmanhua.com/webs/comic-next/{id}
+    // (Confirmed: comic-next/{id} pages show image URLs containing /image/c{id}/,
+    //  and og:url resolves to .../web/comic/{id} — so {id} here is the chapter id,
+    //  not a series/topic id. The series/topic id appears separately, e.g. /web/topic/{topicId}.)
+    const kuaikanMatch = targetUrl.href.match(/kuaikanmanhua\.com\/.*?(\d{5,})/);
+    if (kuaikanMatch) {
+      const chapterId = kuaikanMatch[1];
+
+      const apiUrl = `https://m.kuaikanmanhua.com/v2/mweb/comic/${chapterId}`;
+      const apiHeaders = new Headers();
+      apiHeaders.set("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36");
+      apiHeaders.set("Accept", "application/json, text/plain, */*");
+      apiHeaders.set("Referer", "https://m.kuaikanmanhua.com/");
+      apiHeaders.set("Origin", "https://m.kuaikanmanhua.com");
+      apiHeaders.set("Sec-Fetch-Dest", "empty");
+      apiHeaders.set("Sec-Fetch-Mode", "cors");
+      apiHeaders.set("Sec-Fetch-Site", "same-origin");
+      apiHeaders.set("Sec-Ch-Ua-Mobile", "?1");
+
+      try {
+        const apiRes = await fetch(apiUrl, { method: "GET", headers: apiHeaders, redirect: "follow" });
+        const apiJson = await apiRes.json();
+        const comicInfo = apiJson?.data?.comic_info;
+        const topicInfo = apiJson?.data?.topic_info;
+        if (!comicInfo) throw new Error("Chapter not found");
+
+        return new Response(JSON.stringify({
+          source: "kuaikanmanhua", chapter_id: comicInfo.id, title: comicInfo.title,
+          cover: comicInfo.cover_image_url, is_free: comicInfo.is_free, need_vip: comicInfo.need_vip,
+          topic: topicInfo ? { id: topicInfo.id, title: topicInfo.title, author: topicInfo.user?.nickname } : null,
+          images: comicInfo.images || [],
+          comic_images: (comicInfo.comic_images || []).map(img => ({ url: img.url, width: img.width, height: img.height }))
+        }, null, 2), { status: 200, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "Kuaikan failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
       }
     }
 
-    let chapterUrl = url.searchParams.get("url");
-    if (!chapterUrl) return jsonResp({ error: "Parameter 'url' wajib diisi." }, 400);
+    // ============================================
+    // JJAPTOON - Support multiple domains + try with redirect
+    // ============================================
+    const jjaptoonMatch = targetUrl.href.match(/^https?:\/\/[^/]*jjaptoon[^/]*\/chapters\/(\d+)/);
+    if (jjaptoonMatch) {
+      const chapterId = jjaptoonMatch[1];
 
-    chapterUrl = chapterUrl
-      .replace(/^https?:\/\/m\.ac\.qq\.com\/chapter\//i, "https://ac.qq.com/ComicView/")
-      .replace(/m\.ac\.qq\.com\/chapter/i, "ac.qq.com/ComicView")
-      .replace(/^http:\/\//i, "https://");
+      // Try the original URL first, if 404 try alternative domains
+      const urlsToTry = [
+        targetUrl.toString(),
+        `https://www.jjaptoon003.com/chapters/${chapterId}`,
+        `https://jjaptoon003.com/chapters/${chapterId}`
+      ];
 
-    let html;
-    try {
-      const res = await fetch(chapterUrl, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-          "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        },
-      });
-      if (!res.ok) return jsonResp({ error: "HTTP " + res.status + " dari " + chapterUrl }, res.status);
-      html = await res.text();
-    } catch (e) {
-      return jsonResp({ error: "Gagal ambil HTML: " + e.message }, 500);
-    }
+      let lastError = null;
+      let html = null;
+      let successUrl = null;
 
-    // === EXTRACT DATA ===
-    let dataStr = null;
-    const dataMatch = html.match(/var\s+DATA\s*=\s*'([\s\S]+?)'/) || 
-                      html.match(/var\s+DATA\s*=\s*"([\s\S]+?)"/);
-    if (dataMatch && dataMatch[1] && dataMatch[1].length > 100) {
-      dataStr = dataMatch[1];
-    }
-    if (!dataStr) return jsonResp({ error: "DATA tidak ditemukan di HTML.", url: chapterUrl }, 404);
-
-    // === EXTRACT NONCE ASSIGNMENTS ===
-    const assignRegex = /(?:window\["no"\s*\+\s*"nce"\]|window\["n"\s*\+\s*"once"\]|window\["nonce"\]|window\.nonce|var\s+nonce)\s*=\s*([^;]+);/g;
-    let matches = [];
-    let m;
-    while ((m = assignRegex.exec(html)) !== null) {
-      matches.push({ index: m.index, expr: m[1].trim() });
-    }
-
-    // Sort descending to try the last assignment first (as it overwrites previous ones)
-    matches.sort((a, b) => b.index - a.index);
-
-    let result = null;
-    let validNonce = null;
-
-    for (const match of matches) {
-      const evaluated = safeEval(match.expr);
-      if (evaluated && evaluated.length >= 8) {
+      for (const url of urlsToTry) {
         try {
-          const decoded = tryDecode(dataStr, evaluated);
-          if (decoded && decoded.comic && decoded.picture) {
-            result = decoded;
-            validNonce = evaluated;
+          const pageHeaders = new Headers();
+          pageHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
+          pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+          pageHeaders.set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7");
+          pageHeaders.set("Referer", new URL(url).origin + "/");
+
+          const pageRes = await fetch(url, {
+            method: "GET",
+            headers: pageHeaders,
+            redirect: "follow"
+          });
+
+          if (pageRes.ok) {
+            html = await pageRes.text();
+            successUrl = url;
             break;
+          } else {
+            lastError = `HTTP ${pageRes.status} for ${url}`;
           }
         } catch (e) {
-          // Invalid nonce, continue to next
+          lastError = e.message;
         }
       }
-    }
 
-    // Fallback: Brute force if assignment extraction failed
-    if (!result) {
-      const candidates = new Set();
-      const stringRegex = /(['"])((?:\\.|(?!\1)[^\\])*)\1/g;
-      let sm;
-      while ((sm = stringRegex.exec(html)) !== null) {
-        const s = sm[2];
-        if (s.length >= 8 && s.length <= 100 && /\d/.test(s) && /[a-zA-Z]/.test(s)) {
-          candidates.add(s);
-        }
+      if (!html) {
+        return new Response(
+          JSON.stringify({ 
+            error: "Jjaptoon chapter not found",
+            detail: lastError || "All URLs failed",
+            tried: urlsToTry
+          }),
+          { status: 404, headers: { ...corsHeaders(), "Content-Type": "application/json" }}
+        );
       }
-      
-      for (const candidate of candidates) {
+
+      const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+      const pageTitle = titleMatch ? titleMatch[1].trim() : "";
+
+      let comicTitle = "";
+      let chapterTitle = "";
+
+      if (pageTitle.includes(" - ")) {
+        const parts = pageTitle.split(" - ");
+        comicTitle = parts[0].trim();
+        chapterTitle = parts[1].trim();
+      }
+
+      // jjaptoon serves chapter pages via client-side JS (all <img> tags in the
+      // initial HTML have empty src), so scraping <img>/<script> tags doesn't work.
+      // Instead we reconstruct the storage folder URL from the page title and
+      // probe sequential filenames (001.jpg, 002.jpg, ...) until we hit a 404.
+      //
+      // Folder pattern (confirmed from live example):
+      // https://www.jjaptoon003.com/storage/comics-imported/{comicTitle}/{comicTitle} {N}화/{page}.jpg
+
+      if (!comicTitle || !chapterTitle) {
+        return new Response(
+          JSON.stringify({
+            error: "Could not parse comic/chapter title from page",
+            note: "Image folder is built from the page title, which could not be split into comic_title and chapter_title.",
+            debug: { chapterId, pageTitle, url: successUrl }
+          }),
+          { status: 404, headers: { ...corsHeaders(), "Content-Type": "application/json" }}
+        );
+      }
+
+      const folderPath = `${comicTitle}/${chapterTitle}`;
+      const encodedFolder = folderPath.split("/").map(encodeURIComponent).join("/");
+      const baseImageUrl = `https://www.jjaptoon003.com/storage/comics-imported/${encodedFolder}/`;
+
+      const probeHeaders = new Headers();
+      probeHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
+      probeHeaders.set("Referer", successUrl);
+
+      const comicImages = [];
+      const MAX_PAGES = 200; // safety ceiling
+      let consecutiveMisses = 0;
+
+      for (let n = 1; n <= MAX_PAGES; n++) {
+        const pageNum = String(n).padStart(3, "0");
+        const imgUrl = `${baseImageUrl}${pageNum}.jpg`;
         try {
-          const decoded = tryDecode(dataStr, candidate);
-          if (decoded && decoded.comic && decoded.picture) {
-            result = decoded;
-            validNonce = candidate;
-            break;
+          const headRes = await fetch(imgUrl, { method: "HEAD", headers: probeHeaders, redirect: "follow" });
+          if (headRes.ok) {
+            comicImages.push({ url: imgUrl, alt: "" });
+            consecutiveMisses = 0;
+          } else {
+            consecutiveMisses++;
+            // stop once we've missed twice in a row (handles occasional flaky 404 on a real page)
+            if (consecutiveMisses >= 2) break;
           }
-        } catch (e) {}
+        } catch (e) {
+          consecutiveMisses++;
+          if (consecutiveMisses >= 2) break;
+        }
       }
+
+      // Drop a possible trailing false-positive if the very last miss wasn't checked twice
+      if (comicImages.length === 0) {
+        return new Response(
+          JSON.stringify({
+            error: "No comic images found at reconstructed storage URL",
+            note: "The image folder path is built from the page title. If the site changed its title format or file extension, this pattern needs updating.",
+            debug: { chapterId, comicTitle, chapterTitle, triedBaseUrl: baseImageUrl, url: successUrl }
+          }),
+          { status: 404, headers: { ...corsHeaders(), "Content-Type": "application/json" }}
+        );
+      }
+
+      const result = {
+        source: "jjaptoon",
+        chapter_id: parseInt(chapterId),
+        comic_title: comicTitle,
+        chapter_title: chapterTitle,
+        page_title: pageTitle,
+        total_images: comicImages.length,
+        images: comicImages.map((img, idx) => ({
+          page: idx + 1,
+          url: img.url,
+          alt: img.alt
+        }))
+      };
+
+      return new Response(JSON.stringify(result, null, 2), {
+        status: 200,
+        headers: {
+          ...corsHeaders(),
+          "Content-Type": "application/json"
+        }
+      });
     }
 
-    if (!result) {
-      return jsonResp({ 
-        error: "Gagal decode DATA. Tidak ada kandidat nonce yang valid.",
-        matchesFound: matches.length,
-        hint: "Coba refresh halaman atau gunakan URL chapter yang berbeda"
-      }, 500);
+    // Shinigami support removed — it blocks Cloudflare Workers requests.
+
+    // Fallback proxy
+    let effectiveReferer = targetUrl.origin + "/";
+    let effectiveOrigin = targetUrl.origin;
+    if (referer) { try { const r = new URL(referer); effectiveReferer = referer; effectiveOrigin = r.origin; } catch {} }
+
+    const headers = new Headers();
+    headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+    headers.set("Accept", "text/html,*/*;q=0.8");
+    headers.set("Referer", effectiveReferer);
+    headers.set("Origin", effectiveOrigin);
+
+    try {
+      const response = await fetch(targetUrl.toString(), { method: "GET", headers, redirect: "follow" });
+      const responseHeaders = new Headers(response.headers);
+      responseHeaders.set("Access-Control-Allow-Origin", "*");
+      responseHeaders.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS,HEAD");
+      responseHeaders.set("Access-Control-Allow-Headers", "*");
+      responseHeaders.set("Cross-Origin-Resource-Policy", "cross-origin");
+      responseHeaders.delete("content-security-policy");
+      responseHeaders.delete("x-frame-options");
+      return new Response(response.body, { status: response.status, statusText: response.statusText, headers: responseHeaders });
+    } catch (error) {
+      return new Response("Proxy error: " + error.message, { status: 502, headers: corsHeaders() });
     }
-
-    const pictureList = result.picture || [];
-    if (pictureList.length === 0) return jsonResp({ error: "Tidak ada gambar." }, 404);
-
-    const rawUrls = pictureList.map((p) => p.url);
-    const proxyBase = url.origin + "/img?url=";
-    const proxyUrls = rawUrls.map((u) => proxyBase + encodeURIComponent(u));
-
-    return new Response(JSON.stringify({
-      status: "success",
-      sourceUrl: chapterUrl,
-      comicTitle: (result.comic && result.comic.title) || null,
-      chapterName: (result.chapter && result.chapter.cTitle) || null,
-      total: rawUrls.length,
-      proxyUrls,
-    }, null, 2), {
-      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=3600" },
-    });
   }
 };
 
-function jsonResp(obj, status = 200) {
-  return new Response(JSON.stringify(obj, null, 2), { status, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
-}
-
-function tryDecode(data, nonceStr) {
-  const T = data.split('');
-  const N = nonceStr.match(/\d+[a-zA-Z]+/g) || [];
-  if (N.length === 0) return null;
-  
-  for (let i = N.length - 1; i >= 0; i--) {
-    const token = N[i];
-    const numMatch = token.match(/^(\d+)/);
-    const strMatch = token.match(/[a-zA-Z]+/);
-    if (!numMatch || !strMatch) continue;
-    
-    const locate = parseInt(numMatch[1], 10) & 255;
-    const str = strMatch[0];
-    T.splice(locate, str.length);
-  }
-  
-  const b64 = T.join('');
-  const cleanStr = b64.replace(/[^A-Za-z0-9+/=]/g, "");
-  if (cleanStr.length < 10) return null;
-  
-  const padLen = (4 - (cleanStr.length % 4)) % 4;
-  const paddedStr = cleanStr + "=".repeat(padLen);
-  
-  const binaryString = atob(paddedStr);
-  const bytes = new Uint8Array(binaryString.length);
-  for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
-  
-  return JSON.parse(new TextDecoder('utf-8').decode(bytes));
-}
-
-function safeMathEval(str) {
-  str = str.trim();
-  str = str.replace(/!!([0-9.]+)/g, (m, p1) => parseFloat(p1) !== 0 ? '1' : '0');
-  str = str.replace(/!([0-9.]+)/g, (m, p1) => parseFloat(p1) !== 0 ? '0' : '1');
-  str = str.replace(/!!true/g, '1').replace(/!!false/g, '0');
-  str = str.replace(/!true/g, '0').replace(/!false/g, '1');
-  str = str.replace(/true/g, '1').replace(/false/g, '0');
-  
-  const tokens = [];
-  let i = 0;
-  while (i < str.length) {
-    if (str[i] === ' ') { i++; continue; }
-    if (/[0-9.]/.test(str[i])) {
-      let num = '';
-      while (i < str.length && /[0-9.]/.test(str[i])) { num += str[i]; i++; }
-      tokens.push({ type: 'NUM', value: parseFloat(num) });
-    } else if ('+-*/()'.includes(str[i])) {
-      tokens.push({ type: 'OP', value: str[i] });
-      i++;
-    } else { i++; }
-  }
-  
-  let pos = 0;
-  function parseExpr() {
-    let node = parseTerm();
-    while (pos < tokens.length && tokens[pos].type === 'OP' && (tokens[pos].value === '+' || tokens[pos].value === '-')) {
-      const op = tokens[pos++].value; const right = parseTerm();
-      node = op === '+' ? node + right : node - right;
-    }
-    return node;
-  }
-  function parseTerm() {
-    let node = parseFactor();
-    while (pos < tokens.length && tokens[pos].type === 'OP' && (tokens[pos].value === '*' || tokens[pos].value === '/')) {
-      const op = tokens[pos++].value; const right = parseFactor();
-      node = op === '*' ? node * right : node / right;
-    }
-    return node;
-  }
-  function parseFactor() {
-    if (pos >= tokens.length) return 0;
-    if (tokens[pos].type === 'OP' && tokens[pos].value === '(') {
-      pos++; const node = parseExpr(); if (tokens[pos] && tokens[pos].value === ')') pos++; return node;
-    }
-    if (tokens[pos].type === 'OP' && tokens[pos].value === '-') { pos++; return -parseFactor(); }
-    if (tokens[pos].type === 'OP' && tokens[pos].value === '+') { pos++; return parseFactor(); }
-    return tokens[pos++].value;
-  }
-  return parseExpr();
-}
-
-function safeEval(expr) {
-  const tokens = [];
-  let i = 0;
-  while (i < expr.length) {
-    if (expr[i] === ' ' || expr[i] === '\n' || expr[i] === '\r' || expr[i] === '\t') { i++; continue; }
-    if (expr[i] === '"' || expr[i] === "'") {
-      const quote = expr[i]; let str = ''; i++;
-      while (i < expr.length && expr[i] !== quote) {
-        if (expr[i] === '\\') { i++; str += expr[i]; } else { str += expr[i]; }
-        i++;
-      }
-      i++; tokens.push({ type: 'STRING', value: str });
-    } else if (/[0-9]/.test(expr[i])) {
-      let num = '';
-      while (i < expr.length && /[0-9.]/.test(expr[i])) { num += expr[i]; i++; }
-      tokens.push({ type: 'NUMBER', value: parseFloat(num) });
-    } else if ('+-*/().'.includes(expr[i])) {
-      tokens.push({ type: 'OP', value: expr[i] }); i++;
-    } else if (/[a-zA-Z_$]/.test(expr[i])) {
-      let id = '';
-      while (i < expr.length && /[a-zA-Z0-9_$]/.test(expr[i])) { id += expr[i]; i++; }
-      tokens.push({ type: 'ID', value: id });
-    } else { i++; }
-  }
-
-  let pos = 0;
-  function peek(offset = 0) { return tokens[pos + offset]; }
-  function consume() { return tokens[pos++]; }
-  function expect(type, value) {
-    const t = consume();
-    if (!t || t.type !== type || (value !== undefined && t.value !== value)) throw new Error('Parse error');
-    return t;
-  }
-
-  function parseExpr() {
-    let left = parseTerm();
-    while (peek() && peek().type === 'OP' && (peek().value === '+' || peek().value === '-')) {
-      const op = consume().value; const right = parseTerm();
-      if (op === '+') left = (typeof left === 'string' || typeof right === 'string') ? String(left) + String(right) : left + right;
-      else left = left - right;
-    }
-    return left;
-  }
-
-  function parseTerm() {
-    let left = parseFactor();
-    while (peek() && peek().type === 'OP' && (peek().value === '*' || peek().value === '/')) {
-      const op = consume().value; const right = parseFactor();
-      left = op === '*' ? left * right : left / right;
-    }
-    return left;
-  }
-
-  function parseFactor() {
-    let node; const t = peek();
-    if (!t) throw new Error('Unexpected end');
-    if (t.type === 'OP' && t.value === '(') { consume(); node = parseExpr(); expect('OP', ')'); }
-    else if (t.type === 'STRING') { node = consume().value; }
-    else if (t.type === 'NUMBER') { node = consume().value; }
-    else if (t.type === 'ID') {
-      const id = consume().value;
-      if (id === 'eval') {
-        expect('OP', '('); const arg = parseExpr(); expect('OP', ')');
-        node = safeMathEval(String(arg));
-      } else { node = 0; }
-    } else if (t.type === 'OP' && (t.value === '+' || t.value === '-')) {
-      const op = consume().value; node = parseFactor(); if (op === '-') node = -node;
-    } else { throw new Error('Unexpected token'); }
-
-    while (peek() && peek().type === 'OP' && peek().value === '.') {
-      consume(); const method = expect('ID').value;
-      if (method === 'toString') {
-        expect('OP', '('); let radix = 10;
-        if (peek() && peek().type === 'NUMBER') { radix = consume().value; }
-        expect('OP', ')');
-        if (typeof node === 'number') node = Math.round(node).toString(radix);
-        else node = String(node);
-      }
-    }
-    return node;
-  }
-
-  try { return String(parseExpr()); } catch (e) { return null; }
+function corsHeaders() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET,POST,OPTIONS,HEAD",
+    "Access-Control-Allow-Headers": "*",
+    "Access-Control-Expose-Headers": "*",
+    "Cache-Control": "no-store"
+  };
 }

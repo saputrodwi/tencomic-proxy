@@ -49,6 +49,22 @@ export default {
 
           if (debugInfo.has_DATA_var && debugInfo.has_nonce_assignment) {
             try {
+              const dataMatch = /(?:var|let|const)?\s*DATA\s*=\s*(['"])(.*?)\1/i.exec(html);
+              if (dataMatch) {
+                debugInfo.data_raw_length = dataMatch[2].length;
+                debugInfo.data_raw_sample_start = dataMatch[2].slice(0, 60);
+                debugInfo.data_raw_sample_end = dataMatch[2].slice(-60);
+              }
+
+              const assignRe = /(?:window\[\s*["']n["']\s*\+?\s*["']?once["']?\s*\]|window\[\s*["']no["']\s*\+\s*["']nce["']\s*\]|window\.nonce)\s*=\s*([^;\n]+)/g;
+              let m2, lastRawExpr = null;
+              while ((m2 = assignRe.exec(html)) !== null) lastRawExpr = m2[1];
+              debugInfo.nonce_raw_expr = lastRawExpr;
+
+              const nonceResolved = lastRawExpr ? buildNonceFromExpr(lastRawExpr) : null;
+              debugInfo.nonce_resolved = nonceResolved;
+              debugInfo.nonce_resolved_length = nonceResolved ? nonceResolved.length : null;
+
               const decoded = decodeAcQqChapterData(html);
               debugInfo.decode_success = true;
               debugInfo.total_images = (decoded.picture || []).length;

@@ -13,9 +13,6 @@ export default {
     const referer = reqUrl.searchParams.get("referer") || reqUrl.searchParams.get("ref") || "";
 
     // TEMPORARY DEBUG ENDPOINT — remove after diagnosing the acqq issue.
-    // Visit /?debug=acqq&url=<encoded chapter URL> to see exactly what's
-    // happening: whether the regex matches, whether DATA/nonce are found,
-    // and the raw decode error if any — without needing eval() or guessing.
     if (reqUrl.searchParams.get("debug") === "acqq" && target) {
       let decodedForDebug = target;
       for (let i = 0; i < 3; i++) {
@@ -29,21 +26,21 @@ export default {
       try {
         const u = new URL(decodedForDebug);
         debugInfo.parsed_href = u.href;
-        const m = u.href.match(/ac\.qq\.com\/ComicView\/index\/id\/(\d+)\/cid\/(\d+)/);
+        const m = u.href.match(/ac\.qq\.com\/ComicView\/index\/id\/(\d+)\/cid\/(\d+)/i);
         debugInfo.regex_matched = !!m;
         if (m) debugInfo.matched_ids = { comicId: m[1], chapterCid: m[2] };
 
         if (m) {
           const pageHeaders = new Headers();
-          pageHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
+          pageHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
           pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
           pageHeaders.set("Referer", "https://ac.qq.com/");
           const pageRes = await fetch(u.toString(), { method: "GET", headers: pageHeaders, redirect: "follow" });
           debugInfo.fetch_status = pageRes.status;
           const html = await pageRes.text();
           debugInfo.html_length = html.length;
-          debugInfo.has_DATA_var = /var DATA = '/.test(html);
-          debugInfo.has_nonce_assignment = /window\[\s*["']n["']\s*\+?\s*["']?once["']?\s*\]\s*=/.test(html) || /window\[\s*["']no["']\s*\+\s*["']nce["']\s*\]\s*=/.test(html);
+          debugInfo.has_DATA_var = /(?:var\s+|window\.)?DATA\s*=\s*(['"])([\s\S]*?)\1/.test(html);
+          debugInfo.has_nonce_assignment = extractNonce(html) !== null;
 
           if (debugInfo.has_DATA_var && debugInfo.has_nonce_assignment) {
             try {
@@ -102,13 +99,7 @@ export default {
     // ============================================
     // KUAIKAN MANHUA - Support multiple URL patterns
     // ============================================
-    // Both of these are chapter (comic) ids, just different routes/domains:
-    // Pattern 1: m.kuaikanmanhua.com/mobile/comics/{id}
-    // Pattern 2: www.kuaikanmanhua.com/webs/comic-next/{id}
-    // (Confirmed: comic-next/{id} pages show image URLs containing /image/c{id}/,
-    //  and og:url resolves to .../web/comic/{id} — so {id} here is the chapter id,
-    //  not a series/topic id. The series/topic id appears separately, e.g. /web/topic/{topicId}.)
-    const kuaikanMatch = targetUrl.href.match(/kuaikanmanhua\.com\/.*?(\d{5,})/);
+    const kuaikanMatch = targetUrl.href.match(/kuaikanmanhua\.com\/.*?(\d{5,})/i);
     if (kuaikanMatch) {
       const chapterId = kuaikanMatch[1];
 
@@ -145,11 +136,10 @@ export default {
     // ============================================
     // JJAPTOON - Support multiple domains + try with redirect
     // ============================================
-    const jjaptoonMatch = targetUrl.href.match(/^https?:\/\/[^/]*jjaptoon[^/]*\/chapters\/(\d+)/);
+    const jjaptoonMatch = targetUrl.href.match(/^https?:\/\/[^/]*jjaptoon[^/]*\/chapters\/(\d+)/i);
     if (jjaptoonMatch) {
       const chapterId = jjaptoonMatch[1];
 
-      // Try the original URL first, if 404 try alternative domains
       const urlsToTry = [
         targetUrl.toString(),
         `https://www.jjaptoon003.com/chapters/${chapterId}`,
@@ -163,7 +153,7 @@ export default {
       for (const url of urlsToTry) {
         try {
           const pageHeaders = new Headers();
-          pageHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
+          pageHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
           pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
           pageHeaders.set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7");
           pageHeaders.set("Referer", new URL(url).origin + "/");
@@ -209,14 +199,6 @@ export default {
         chapterTitle = parts[1].trim();
       }
 
-      // jjaptoon serves chapter pages via client-side JS (all <img> tags in the
-      // initial HTML have empty src), so scraping <img>/<script> tags doesn't work.
-      // Instead we reconstruct the storage folder URL from the page title and
-      // probe sequential filenames (001.jpg, 002.jpg, ...) until we hit a 404.
-      //
-      // Folder pattern (confirmed from live example):
-      // https://www.jjaptoon003.com/storage/comics-imported/{comicTitle}/{comicTitle} {N}화/{page}.jpg
-
       if (!comicTitle || !chapterTitle) {
         return new Response(
           JSON.stringify({
@@ -232,25 +214,44 @@ export default {
       const encodedFolder = folderPath.split("/").map(encodeURIComponent).join("/");
       const baseImageUrl = `https://www.jjaptoon003.com/storage/comics-imported/${encodedFolder}/`;
 
-      const probeHeaders = new Headers();
-      probeHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
-      probeHeaders.set("Referer", successUrl);
-
       const comicImages = [];
-      const MAX_PAGES = 200; // safety ceiling
+      const MAX_PAGES = 200; 
       let consecutiveMisses = 0;
 
       for (let n = 1; n <= MAX_PAGES; n++) {
         const pageNum = String(n).padStart(3, "0");
         const imgUrl = `${baseImageUrl}${pageNum}.jpg`;
         try {
-          const headRes = await fetch(imgUrl, { method: "HEAD", headers: probeHeaders, redirect: "follow" });
-          if (headRes.ok) {
+          const probeHeaders = new Headers();
+          probeHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
+          probeHeaders.set("Referer", successUrl);
+
+          // Cek dengan HEAD, bila di-blok oleh CDN (status 403/405), fallback pakai GET dengan header Range (hanya meminta 1 byte pertama)
+          let isOk = false;
+          try {
+            const headRes = await fetch(imgUrl, { method: "HEAD", headers: probeHeaders, redirect: "follow" });
+            if (headRes.ok) {
+              isOk = true;
+            } else if (headRes.status === 405 || headRes.status === 403) {
+              probeHeaders.set("Range", "bytes=0-0");
+              const getRes = await fetch(imgUrl, { method: "GET", headers: probeHeaders, redirect: "follow" });
+              if (getRes.status === 200 || getRes.status === 206) {
+                isOk = true;
+              }
+            }
+          } catch {
+            probeHeaders.set("Range", "bytes=0-0");
+            const getRes = await fetch(imgUrl, { method: "GET", headers: probeHeaders, redirect: "follow" });
+            if (getRes.status === 200 || getRes.status === 206) {
+              isOk = true;
+            }
+          }
+
+          if (isOk) {
             comicImages.push({ url: imgUrl, alt: "" });
             consecutiveMisses = 0;
           } else {
             consecutiveMisses++;
-            // stop once we've missed twice in a row (handles occasional flaky 404 on a real page)
             if (consecutiveMisses >= 2) break;
           }
         } catch (e) {
@@ -259,7 +260,6 @@ export default {
         }
       }
 
-      // Drop a possible trailing false-positive if the very last miss wasn't checked twice
       if (comicImages.length === 0) {
         return new Response(
           JSON.stringify({
@@ -294,18 +294,16 @@ export default {
       });
     }
 
-    // Shinigami support removed — it blocks Cloudflare Workers requests.
-
     // ============================================
     // AC.QQ.COM - Free chapters, requires custom deobfuscation
     // ============================================
-    const acqqMatch = targetUrl.href.match(/ac\.qq\.com\/ComicView\/index\/id\/(\d+)\/cid\/(\d+)/);
+    const acqqMatch = targetUrl.href.match(/ac\.qq\.com\/ComicView\/index\/id\/(\d+)\/cid\/(\d+)/i);
     if (acqqMatch) {
       const [, comicId, chapterCid] = acqqMatch;
 
       try {
         const pageHeaders = new Headers();
-        pageHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
+        pageHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
         pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
         pageHeaders.set("Referer", "https://ac.qq.com/");
 
@@ -351,14 +349,14 @@ export default {
       }
     }
 
-    // Fallback proxy
+    // Fallback proxy (Untuk pemuatan asset / bypass CORS gambar)
     let effectiveReferer = targetUrl.origin + "/";
     let effectiveOrigin = targetUrl.origin;
     if (referer) { try { const r = new URL(referer); effectiveReferer = referer; effectiveOrigin = r.origin; } catch {} }
 
     const headers = new Headers();
-    headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
-    headers.set("Accept", "text/html,*/*;q=0.8");
+    headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
+    headers.set("Accept", "text/html,image/*,*/*;q=0.8");
     headers.set("Referer", effectiveReferer);
     headers.set("Origin", effectiveOrigin);
 
@@ -370,7 +368,14 @@ export default {
       responseHeaders.set("Access-Control-Allow-Headers", "*");
       responseHeaders.set("Cross-Origin-Resource-Policy", "cross-origin");
       responseHeaders.delete("content-security-policy");
+      responseHeaders.delete("content-security-policy-report-only");
       responseHeaders.delete("x-frame-options");
+
+      // PENTING: Hapus content-encoding dan content-length agar browser tidak mengalami error ERR_CONTENT_DECODING_FAILED 
+      // ketika Cloudflare Workers otomatis mendekompresi konten gambarnya.
+      responseHeaders.delete("content-encoding");
+      responseHeaders.delete("content-length");
+
       return new Response(response.body, { status: response.status, statusText: response.statusText, headers: responseHeaders });
     } catch (error) {
       return new Response("Proxy error: " + error.message, { status: 502, headers: corsHeaders() });
@@ -388,53 +393,31 @@ function corsHeaders() {
   };
 }
 
-// ============================================
-// AC.QQ.COM decoder — no eval(), safe for Cloudflare Workers.
-//
-// The chapter page embeds `var DATA = '<base64-ish string>'`, which is not
-// plain base64: certain character ranges must be stripped first, per removal
-// instructions derived from `window.nonce`. The nonce itself is sometimes a
-// plain hex string, and sometimes assembled from small inline JS expressions
-// like `(+eval("Math.pow(1,3)+1+1")).toString()`. Since eval() is disallowed
-// in Workers, the limited expression grammar actually seen on this site is
-// parsed and evaluated by hand below instead of using eval().
-//
-// Algorithm (reverse engineered from ac.page.chapter.view_v2.7.0.js):
-//   T = DATA.split('')
-//   N = nonce.match(/\d+[a-zA-Z]+/g)
-//   for each match in N, iterating from the LAST match to the FIRST:
-//       locate = parseInt(leadingDigits) & 255
-//       removeCount = length of the trailing letters part
-//       T.splice(locate, removeCount)
-//   cleanedBase64 = T.join('')
-//   json = JSON.parse(utf8Decode(base64Decode(cleanedBase64)))
-// ============================================
-
 function safeEvalNonceExpr(expr) {
   let e = expr.trim();
 
-  // Known browser-environment stand-ins the site's nonce script tends to probe.
-  // These are always true/defined in a real browser, so hardcode their effect.
+  // Bersihkan dari variabel browser yang sering digunakan web sebagai pengecekan.
   e = e.replace(/!!document\.getElementsByTagName\(['"]html['"]\)/g, "true");
   e = e.replace(/!window\.Array/g, "false");
   e = e.replace(/!!window\.Array/g, "true");
   e = e.replace(/typeof\s+window\s*!==?\s*['"]undefined['"]/g, "true");
   e = e.replace(/typeof\s+document\s*!==?\s*['"]undefined['"]/g, "true");
 
-  // Math.pow(a,b)
   e = e.replace(/Math\.pow\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)/g,
     (_, a, b) => String(Math.pow(parseFloat(a), parseFloat(b))));
 
-  if (!/^[\d\s+\-*/%().<>=!?:truefalse]+$/i.test(e)) {
-    throw new Error("Unrecognized nonce expression pattern: " + expr);
+  try {
+    // Evaluasi ekspresi aritmatika murni dengan new Function()
+    return new Function(`return (${e})`)();
+  } catch (err) {
+    // Fallback ke parser matematika bawaan apabila dilarang oleh server worker Anda
+    if (!/^[\d\s+\-*/%().<>=!?:truefalse]+$/i.test(e)) {
+      throw new Error("Unrecognized nonce expression pattern: " + expr);
+    }
+    return evalArithmeticBooleanTernary(e);
   }
-
-  return evalArithmeticBooleanTernary(e);
 }
 
-// Minimal recursive-descent evaluator for: number literals, true/false,
-// + - * / % with parens and unary +/-/!, comparisons (< > <= >= == ===),
-// and the ternary operator. No identifiers, no function calls, no eval.
 function evalArithmeticBooleanTernary(src) {
   let pos = 0;
   const s = src.replace(/\s+/g, "");
@@ -518,22 +501,30 @@ function evalArithmeticBooleanTernary(src) {
   return result;
 }
 
-// Extract the final nonce value from a chapter page's HTML, WITHOUT eval().
 function extractNonce(html) {
-  const assignRe = /window\[\s*["']n["']\s*\+?\s*["']?once["']?\s*\]\s*=\s*([^;]+);|window\[\s*["']no["']\s*\+\s*["']nce["']\s*\]\s*=\s*([^;]+);/g;
-  let match;
-  let lastExpr = null;
-  while ((match = assignRe.exec(html)) !== null) {
-    lastExpr = match[1] || match[2];
+  const patterns = [
+    /window\[\s*["']n["']\s*\+\s*["']once["']\s*\]\s*=\s*([^;\n<]+)/,
+    /window\[\s*["']no["']\s*\+\s*["']nce["']\s*\]\s*=\s*([^;\n<]+)/,
+    /window\[\s*["']nonce["']\s*\]\s*=\s*([^;\n<]+)/,
+    /window\.nonce\s*=\s*([^;\n<]+)/,
+    /var\s+nonce\s*=\s*([^;\n<]+)/
+  ];
+
+  for (const pattern of patterns) {
+    const match = pattern.exec(html);
+    if (match) {
+      try {
+        const expr = match[1];
+        const built = buildNonceFromExpr(expr);
+        if (built) return built;
+      } catch (e) {
+        continue;
+      }
+    }
   }
-  if (!lastExpr) return null;
-  return buildNonceFromExpr(lastExpr);
+  return null;
 }
 
-// Parse an expression like:
-//   '' + '6adacb40f9dfb6994505268ae7fed911'
-// or:
-//   "d56fb1" + (+eval("9 * 0")).toString() + "8" + (+eval("Math.pow(1,3)+1+1")).toString() + ...
 function buildNonceFromExpr(expr) {
   const pieces = splitTopLevelPlus(expr);
   let result = "";
@@ -546,13 +537,24 @@ function buildNonceFromExpr(expr) {
       continue;
     }
 
-    const evalMatch = /^\(\+eval\((["'])((?:(?!\1).)*)\1\)\)\.toString\(\)$/.exec(p);
+    const evalMatch = /^\(\s*\+\s*eval\(\s*(["'])((?:(?!\1).)*)\1\s*\)\s*\)\s*\.\s*toString\(\s*\)$/.exec(p);
     if (evalMatch) {
       const innerExpr = evalMatch[2];
       const value = safeEvalNonceExpr(innerExpr);
       result += String(+value);
       continue;
     }
+
+    if (/^\d+$/.test(p)) {
+      result += p;
+      continue;
+    }
+
+    try {
+      const val = safeEvalNonceExpr(p);
+      result += String(val);
+      continue;
+    } catch (err) {}
 
     throw new Error("Unrecognized nonce piece: " + p);
   }
@@ -583,7 +585,7 @@ function splitTopLevelPlus(expr) {
 
 function cleanAcQqData(dataRaw, nonce) {
   const T = dataRaw.split("");
-  const N = nonce.match(/\d+[a-zA-Z]+/g) || [];
+  const N = (nonce && typeof nonce === "string") ? (nonce.match(/\d+[a-zA-Z]+/g) || []) : [];
   for (let j = N.length - 1; j >= 0; j--) {
     const m = N[j];
     const digits = /^\d+/.exec(m)[0];
@@ -602,12 +604,10 @@ function acQqBase64ToUtf8(b64) {
   return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
 }
 
-// Main entry point: given the raw chapter page HTML, return the parsed
-// comic/chapter/picture data, or throw with a descriptive message.
 function decodeAcQqChapterData(html) {
-  const dataMatch = /var DATA = '([^']+)'/.exec(html);
+  const dataMatch = /(?:var\s+|window\.)?DATA\s*=\s*(['"])([\s\S]*?)\1/.exec(html);
   if (!dataMatch) throw new Error("DATA variable not found in page HTML");
-  const dataRaw = dataMatch[1];
+  const dataRaw = dataMatch[2];
 
   const nonce = extractNonce(html);
   if (!nonce) throw new Error("nonce assignment not found in page HTML");

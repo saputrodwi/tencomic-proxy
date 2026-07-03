@@ -36,6 +36,7 @@ export default {
       return new Response("Only http/https", { status: 400, headers: corsHeaders() });
     }
 
+    // umum: proteksi SSRF
     const hostname = targetUrl.hostname.toLowerCase();
     if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "0.0.0.0" || hostname === "::1" ||
         /^10\./.test(hostname) || /^192\.168\./.test(hostname) || /^172\.(1[6-9]|2\d|3[01])\./.test(hostname) ||
@@ -43,16 +44,21 @@ export default {
       return new Response("Forbidden", { status: 403, headers: corsHeaders() });
     }
 
-    // Kuaikan
+    // kuaikan: dua pola URL (mobile/comics/{id} dan webs/comic-next/{id}) sama-sama chapter id
     const kuaikanMatch = targetUrl.href.match(/kuaikanmanhua\.com\/.*?(\d{5,})/);
     if (kuaikanMatch) {
       const chapterId = kuaikanMatch[1];
+
       const apiUrl = `https://m.kuaikanmanhua.com/v2/mweb/comic/${chapterId}`;
       const apiHeaders = new Headers();
       apiHeaders.set("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36");
       apiHeaders.set("Accept", "application/json, text/plain, */*");
       apiHeaders.set("Referer", "https://m.kuaikanmanhua.com/");
       apiHeaders.set("Origin", "https://m.kuaikanmanhua.com");
+      apiHeaders.set("Sec-Fetch-Dest", "empty");
+      apiHeaders.set("Sec-Fetch-Mode", "cors");
+      apiHeaders.set("Sec-Fetch-Site", "same-origin");
+      apiHeaders.set("Sec-Ch-Ua-Mobile", "?1");
 
       try {
         const apiRes = await fetch(apiUrl, { method: "GET", headers: apiHeaders, redirect: "follow" });
@@ -62,31 +68,22 @@ export default {
         if (!comicInfo) throw new Error("Chapter not found");
 
         return new Response(JSON.stringify({
-          source: "kuaikanmanhua",
-          chapter_id: comicInfo.id,
-          title: comicInfo.title,
-          cover: comicInfo.cover_image_url,
-          is_free: comicInfo.is_free,
-          need_vip: comicInfo.need_vip,
+          source: "kuaikanmanhua", chapter_id: comicInfo.id, title: comicInfo.title,
+          cover: comicInfo.cover_image_url, is_free: comicInfo.is_free, need_vip: comicInfo.need_vip,
           topic: topicInfo ? { id: topicInfo.id, title: topicInfo.title, author: topicInfo.user?.nickname } : null,
           images: comicInfo.images || [],
           comic_images: (comicInfo.comic_images || []).map(img => ({ url: img.url, width: img.width, height: img.height }))
-        }, null, 2), {
-          status: 200,
-          headers: { ...corsHeaders(), "Content-Type": "application/json" }
-        });
+        }, null, 2), { status: 200, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
       } catch (err) {
-        return new Response(JSON.stringify({ error: "Kuaikan failed", detail: err.message }), {
-          status: 502,
-          headers: { ...corsHeaders(), "Content-Type": "application/json" }
-        });
+        return new Response(JSON.stringify({ error: "Kuaikan failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
       }
     }
 
-    // Jjaptoon
+    // jjaptoon: img src kosong di HTML awal (render JS), jadi URL gambar direkonstruksi dari judul komik + chapter
     const jjaptoonMatch = targetUrl.href.match(/^https?:\/\/[^/]*jjaptoon[^/]*\/chapters\/(\d+)/);
     if (jjaptoonMatch) {
       const chapterId = jjaptoonMatch[1];
+
       const urlsToTry = [
         targetUrl.toString(),
         `https://www.jjaptoon003.com/chapters/${chapterId}`,
@@ -105,11 +102,7 @@ export default {
           pageHeaders.set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7");
           pageHeaders.set("Referer", new URL(url).origin + "/");
 
-          const pageRes = await fetch(url, {
-            method: "GET",
-            headers: pageHeaders,
-            redirect: "follow"
-          });
+          const pageRes = await fetch(url, { method: "GET", headers: pageHeaders, redirect: "follow" });
 
           if (pageRes.ok) {
             html = await pageRes.text();
@@ -130,7 +123,7 @@ export default {
             detail: lastError || "All URLs failed",
             tried: urlsToTry
           }),
-          { status: 404, headers: { ...corsHeaders(), "Content-Type": "application/json" } }
+          { status: 404, headers: { ...corsHeaders(), "Content-Type": "application/json" }}
         );
       }
 
@@ -139,6 +132,7 @@ export default {
 
       let comicTitle = "";
       let chapterTitle = "";
+
       if (pageTitle.includes(" - ")) {
         const parts = pageTitle.split(" - ");
         comicTitle = parts[0].trim();
@@ -148,10 +142,11 @@ export default {
       if (!comicTitle || !chapterTitle) {
         return new Response(
           JSON.stringify({
-            error: "Could not parse comic/chapter title",
+            error: "Could not parse comic/chapter title from page",
+            note: "Image folder is built from the page title, which could not be split into comic_title and chapter_title.",
             debug: { chapterId, pageTitle, url: successUrl }
           }),
-          { status: 404, headers: { ...corsHeaders(), "Content-Type": "application/json" } }
+          { status: 404, headers: { ...corsHeaders(), "Content-Type": "application/json" }}
         );
       }
 
@@ -169,12 +164,14 @@ export default {
         try {
           const res = await fetch(imgUrl, { method: "HEAD", headers: probeHeaders, redirect: "follow" });
           return { ok: res.ok, url: imgUrl };
-        } catch {
+        } catch (e) {
           return { ok: false, url: imgUrl };
         }
       }
 
+      // jjaptoon: binary search cari halaman terakhir (~9-10 request, aman dari limit 50 subrequest Cloudflare Free plan), gap di tengah chapter akan gagal sendiri saat download
       const HARD_MAX_PAGE = 300;
+
       let lo = 1, hi = HARD_MAX_PAGE;
       let highestKnownGood = 0;
       let searchCalls = 0;
@@ -206,37 +203,38 @@ export default {
       if (comicImages.length === 0) {
         return new Response(
           JSON.stringify({
-            error: "No comic images found",
+            error: "No comic images found at reconstructed storage URL",
+            note: "The image folder path is built from the page title. If the site changed its title format or file extension, this pattern needs updating.",
             debug: { chapterId, comicTitle, chapterTitle, triedBaseUrl: baseImageUrl, url: successUrl }
           }),
-          { status: 404, headers: { ...corsHeaders(), "Content-Type": "application/json" } }
+          { status: 404, headers: { ...corsHeaders(), "Content-Type": "application/json" }}
         );
       }
 
-      return new Response(JSON.stringify({
+      const result = {
         source: "jjaptoon",
         chapter_id: parseInt(chapterId),
         comic_title: comicTitle,
         chapter_title: chapterTitle,
         page_title: pageTitle,
         total_images: comicImages.length,
-        images: comicImages
-      }, null, 2), {
+        images: comicImages.map((img) => ({
+          page: img.page,
+          url: img.url,
+          alt: img.alt
+        }))
+      };
+
+      return new Response(JSON.stringify(result, null, 2), {
         status: 200,
         headers: { ...corsHeaders(), "Content-Type": "application/json" }
       });
     }
 
-    // Fallback proxy
+    // umum: fallback proxy generic untuk URL apa saja yang tidak dikenali di atas
     let effectiveReferer = targetUrl.origin + "/";
     let effectiveOrigin = targetUrl.origin;
-    if (referer) {
-      try {
-        const r = new URL(referer);
-        effectiveReferer = referer;
-        effectiveOrigin = r.origin;
-      } catch {}
-    }
+    if (referer) { try { const r = new URL(referer); effectiveReferer = referer; effectiveOrigin = r.origin; } catch {} }
 
     const headers = new Headers();
     headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
@@ -253,11 +251,7 @@ export default {
       responseHeaders.set("Cross-Origin-Resource-Policy", "cross-origin");
       responseHeaders.delete("content-security-policy");
       responseHeaders.delete("x-frame-options");
-      return new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: responseHeaders
-      });
+      return new Response(response.body, { status: response.status, statusText: response.statusText, headers: responseHeaders });
     } catch (error) {
       return new Response("Proxy error: " + error.message, { status: 502, headers: corsHeaders() });
     }

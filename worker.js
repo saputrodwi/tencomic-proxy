@@ -45,20 +45,23 @@ export default {
           
           // Fix: Allow both single/double quotes and flexible declarations
           debugInfo.has_DATA_var = /(?:var|let|const)?\s*DATA\s*=\s*['"]/.test(html);
-          debugInfo.has_nonce_assignment = /(?:window\[\s*["']n["']\s*\+?\s*["']?once["']?\s*\]|window\[\s*["']no["']\s*\+\s*["']nce["']\s*\]|window\.nonce)\s*=/.test(html);
+          debugInfo.has_nonce_assignment = /window\.nonce\s*=|window\[\s*(?:["'][^"']*["']\s*\+?\s*)+\]\s*=/.test(html);
 
           if (debugInfo.has_DATA_var && debugInfo.has_nonce_assignment) {
             try {
-              const dataMatch = /(?:var|let|const)?\s*DATA\s*=\s*(['"])(.*?)\1/i.exec(html);
-              if (dataMatch) {
-                debugInfo.data_raw_length = dataMatch[2].length;
-                debugInfo.data_raw_sample_start = dataMatch[2].slice(0, 60);
-                debugInfo.data_raw_sample_end = dataMatch[2].slice(-60);
+              // Greedy match up to the LAST quote+semicolon in the file for this
+              // quote style avoids truncating on a stray quote inside the blob;
+              // acQqExtractData() does the robust version, reuse it here.
+              const dataRaw = acQqExtractData(html);
+              if (dataRaw) {
+                debugInfo.data_raw_length = dataRaw.length;
+                debugInfo.data_raw_sample_start = dataRaw.slice(0, 60);
+                debugInfo.data_raw_sample_end = dataRaw.slice(-60);
               }
 
-              const assignRe = /(?:window\[\s*["']n["']\s*\+?\s*["']?once["']?\s*\]|window\[\s*["']no["']\s*\+\s*["']nce["']\s*\]|window\.nonce)\s*=\s*([^;\n]+)/g;
-              let m2, lastRawExpr = null;
-              while ((m2 = assignRe.exec(html)) !== null) lastRawExpr = m2[1];
+              const assignments = findAllNonceAssignments(html);
+              debugInfo.nonce_assignment_count = assignments.length;
+              const lastRawExpr = assignments.length ? assignments[assignments.length - 1].expr : null;
               debugInfo.nonce_raw_expr = lastRawExpr;
 
               const nonceResolved = lastRawExpr ? buildNonceFromExpr(lastRawExpr) : null;
@@ -529,15 +532,44 @@ function evalArithmeticBooleanTernary(src) {
   return result;
 }
 
-// FIX: More relaxed regex to handle multiple structures of window.nonce assignments
-function extractNonce(html) {
-  const assignRe = /(?:window\[\s*["']n["']\s*\+?\s*["']?once["']?\s*\]|window\[\s*["']no["']\s*\+\s*["']nce["']\s*\]|window\.nonce)\s*=\s*([^;\n]+)/g;
-  let match;
-  let lastExpr = null;
-  while ((match = assignRe.exec(html)) !== null) {
-    lastExpr = match[1];
+// Find every `window[<key-expr>] = <value-expr>;` or `window.nonce = <value-expr>;`
+// assignment in the page, evaluate <key-expr> generically (it's always a
+// concatenation of string literals, split in different ways across pages,
+// e.g. 'n'+'once', 'no'+'nce', 'n'+'onc'+'e', etc.), and keep the value
+// expression from whichever assignment's key evaluates to exactly "nonce".
+// The LAST such assignment in document order wins (later script wins,
+// matching normal JS execution/assignment order).
+function findAllNonceAssignments(html) {
+  const results = [];
+
+  // window.nonce = <expr>;
+  const dotRe = /window\.nonce\s*=\s*([^;\n]+)/g;
+  let m;
+  while ((m = dotRe.exec(html)) !== null) {
+    results.push({ index: m.index, expr: m[1] });
   }
-  if (!lastExpr) return null;
+
+  // window[ <string-literal-concatenation> ] = <expr>;
+  const bracketRe = /window\[\s*((?:["'][^"']*["']\s*\+?\s*)+)\]\s*=\s*([^;\n]+)/g;
+  while ((m = bracketRe.exec(html)) !== null) {
+    const keyExpr = m[1];
+    // Evaluate the key: concatenate all string literal pieces.
+    const literals = keyExpr.match(/["']([^"']*)["']/g);
+    if (!literals) continue;
+    const key = literals.map((s) => s.slice(1, -1)).join("");
+    if (key === "nonce") {
+      results.push({ index: m.index, expr: m[2] });
+    }
+  }
+
+  results.sort((a, b) => a.index - b.index);
+  return results;
+}
+
+function extractNonce(html) {
+  const assignments = findAllNonceAssignments(html);
+  if (assignments.length === 0) return null;
+  const lastExpr = assignments[assignments.length - 1].expr;
   return buildNonceFromExpr(lastExpr);
 }
 
@@ -666,11 +698,40 @@ function acQqBase64ToUtf8(b64) {
   return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
 }
 
+// Robustly extract the DATA string literal's raw contents. Using a
+// non-greedy (['"])(.*?)\1 regex is unsafe here: if the base64 blob
+// itself ever contains a quote character before its real end, it
+// truncates early. Instead, find the opening quote after `DATA =`,
+// then scan forward for that same quote character immediately
+// followed by `;` (the actual statement terminator used on this site).
+function acQqExtractData(html) {
+  const declIdx = /(?:var|let|const)?\s*DATA\s*=\s*/i.exec(html);
+  if (!declIdx) return null;
+  const afterDecl = declIdx.index + declIdx[0].length;
+  const quoteChar = html[afterDecl];
+  if (quoteChar !== "'" && quoteChar !== '"') return null;
+
+  const contentStart = afterDecl + 1;
+  // DATA is often declared as part of a multi-variable `var` statement
+  // (e.g. `var DATA = '...', ID = _v.comic.id, ...`), so its string
+  // literal can be terminated by either `;` or `,`, not just `;`.
+  let closeIdx = -1;
+  for (let i = contentStart; i < html.length; i++) {
+    if (html[i] === quoteChar && html[i - 1] !== "\\") {
+      const next = html[i + 1];
+      if (next === ";" || next === ",") {
+        closeIdx = i;
+        break;
+      }
+    }
+  }
+  if (closeIdx === -1) return null;
+  return html.slice(contentStart, closeIdx);
+}
+
 function decodeAcQqChapterData(html) {
-  // FIX: Make variable regex more resilient to let/const or double quote variances
-  const dataMatch = /(?:var|let|const)?\s*DATA\s*=\s*(['"])(.*?)\1/i.exec(html);
-  if (!dataMatch) throw new Error("DATA variable not found in page HTML");
-  const dataRaw = dataMatch[2];
+  const dataRaw = acQqExtractData(html);
+  if (!dataRaw) throw new Error("DATA variable not found in page HTML");
 
   const nonce = extractNonce(html);
   if (!nonce) throw new Error("nonce assignment not found in page HTML");

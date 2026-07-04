@@ -231,6 +231,79 @@ export default {
       });
     }
 
+    // baozimh/twmanga: chapter diakses lewat www.twmanga.com, tapi datanya diambil dari app.baozimh.com pakai header app khusus
+    const baoziMatch = targetUrl.href.match(/(?:twmanga\.com|baozimh\.com)\/(?:comic\/chapter|baozimhapp\/comic\/chapter)\/([^/]+)\/([^/?#]+)\.html/);
+    if (baoziMatch) {
+      const comicSlug = baoziMatch[1];
+      const chapterFile = baoziMatch[2];
+
+      const apiUrl = `https://app.baozimh.com/baozimhapp/comic/chapter/${comicSlug}/${chapterFile}.html`;
+
+      const baoziHeaders = new Headers();
+      baoziHeaders.set("Referer", "https://appgb.baozimh.com/");
+      baoziHeaders.set("app-id", "cn.sts.xiaoyun.ordermeals");
+      baoziHeaders.set("device-code", "6ca052067aa9833084daaa6ffeba0913");
+      baoziHeaders.set("device-id", "RKQ1.201217.002");
+      baoziHeaders.set("user-agent", "baozimh_android/1.0.31/gb/adset");
+      baoziHeaders.set("app-version", "1.0.31");
+      baoziHeaders.set("Accept-Encoding", "gzip");
+      baoziHeaders.set("Connection", "Keep-Alive");
+
+      try {
+        const apiRes = await fetch(apiUrl, { method: "GET", headers: baoziHeaders, redirect: "follow" });
+        if (!apiRes.ok) throw new Error(`HTTP ${apiRes.status}`);
+        const html = await apiRes.text();
+
+        // judul halaman berformat "{chapter_title} - {comic_title} - 包子漫画"
+        const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+        const pageTitle = titleMatch ? titleMatch[1].trim() : "";
+        const titleParts = pageTitle.split(" - ");
+        const chapterTitle = titleParts[0]?.trim() || "";
+        const comicTitle = titleParts[1]?.trim() || "";
+
+        // gambar chapter dirender server-side sebagai <img class="comic-contain__item" data-src="...">
+        const imgRegex = /<img\b[^>]*\bclass="comic-contain__item"[^>]*>/gi;
+        const imgTags = html.match(imgRegex) || [];
+
+        const comicImages = imgTags.map((tag, idx) => {
+          const srcMatch = tag.match(/data-src="([^"]+)"/i);
+          const idxMatch = tag.match(/data-index="(\d+)"/i);
+          const wMatch = tag.match(/data-w="(\d+)"/i);
+          const hMatch = tag.match(/data-h="(\d+)"/i);
+          return {
+            page: idxMatch ? parseInt(idxMatch[1]) + 1 : idx + 1,
+            url: srcMatch ? srcMatch[1] : null,
+            width: wMatch ? parseInt(wMatch[1]) : null,
+            height: hMatch ? parseInt(hMatch[1]) : null
+          };
+        }).filter(img => img.url);
+
+        if (comicImages.length === 0) {
+          return new Response(
+            JSON.stringify({
+              error: "No comic images found in baozimh chapter page",
+              note: "Expected <img class=\"comic-contain__item\" data-src=\"...\"> tags. The site may have changed its markup.",
+              debug: { comicSlug, chapterFile, pageTitle, apiUrl }
+            }),
+            { status: 404, headers: { ...corsHeaders(), "Content-Type": "application/json" }}
+          );
+        }
+
+        return new Response(JSON.stringify({
+          source: "baozimh",
+          comic_slug: comicSlug,
+          chapter_file: chapterFile,
+          comic_title: comicTitle,
+          chapter_title: chapterTitle,
+          page_title: pageTitle,
+          total_images: comicImages.length,
+          images: comicImages
+        }, null, 2), { status: 200, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "Baozimh failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
+      }
+    }
+
     // umum: fallback proxy generic untuk URL apa saja yang tidak dikenali di atas
     let effectiveReferer = targetUrl.origin + "/";
     let effectiveOrigin = targetUrl.origin;

@@ -49,17 +49,29 @@ export default {
     if (jjaptoonMatch) {
       const chapterId = jjaptoonMatch[1];
 
-      const urlsToTry = [
+      // Build dynamic domain list from input + common fallbacks
+      const inputHost = targetUrl.hostname;
+      const domains = new Set([
         targetUrl.toString(),
-        `https://www.jjaptoon003.com/chapters/${chapterId}`,
-        `https://jjaptoon003.com/chapters/${chapterId}`
-      ];
+        `${targetUrl.origin}/chapters/${chapterId}`
+      ]);
+      // www / non-www variant
+      if (inputHost.startsWith('www.')) {
+        domains.add(`https://${inputHost.slice(4)}/chapters/${chapterId}`);
+      } else {
+        domains.add(`https://www.${inputHost}/chapters/${chapterId}`);
+      }
+      // Known fallbacks
+      domains.add(`https://www.jjaptoon.vip/chapters/${chapterId}`);
+      domains.add(`https://jjaptoon.vip/chapters/${chapterId}`);
+      domains.add(`https://www.jjaptoon003.com/chapters/${chapterId}`);
+      domains.add(`https://jjaptoon003.com/chapters/${chapterId}`);
 
       let lastError = null;
       let html = null;
       let successUrl = null;
 
-      for (const url of urlsToTry) {
+      for (const url of domains) {
         try {
           const pageHeaders = new Headers();
           pageHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
@@ -86,7 +98,7 @@ export default {
           JSON.stringify({
             error: "Jjaptoon chapter not found",
             detail: lastError || "All URLs failed",
-            tried: urlsToTry
+            tried: Array.from(domains)
           }),
           { status: 404, headers: { ...corsHeaders(), "Content-Type": "application/json" }}
         );
@@ -115,9 +127,71 @@ export default {
         );
       }
 
+      // === NEW: Extract image URLs directly from HTML first ===
+      const imageUrls = [];
+      const seenUrls = new Set();
+
+      const addUrl = (raw) => {
+        let src = raw.trim();
+        if (!src || src === '""' || src === "''" || src.startsWith('data:')) return;
+        if (src.startsWith('//')) src = 'https:' + src;
+        else if (!src.startsWith('http')) src = new URL(src, successUrl).href;
+        if (seenUrls.has(src)) return;
+        seenUrls.add(src);
+        imageUrls.push(src);
+      };
+
+      // Pattern 1: img tag attributes (src, data-src, data-original, data-url, data-lazy-src)
+      const attrNames = ['src', 'data-src', 'data-original', 'data-url', 'data-lazy-src'];
+      for (const attr of attrNames) {
+        const regex = new RegExp(`<img[^>]*\\b${attr}\\s*=\\s*["']([^"']+)["'][^>]*>`, 'gi');
+        let match;
+        while ((match = regex.exec(html)) !== null) {
+          const val = match[1].trim();
+          if (val.includes('attachment/scraping/') || val.match(/\.(jpg|jpeg|png|webp|gif)(\?.*)?$/i)) {
+            addUrl(val);
+          }
+        }
+      }
+
+      // Pattern 2: any attachment/scraping URL anywhere in HTML
+      if (imageUrls.length === 0) {
+        const scrapingRegex = /(https?:\/\/[^"'\s<>]+attachment\/scraping\/[^"'\s<>]+\.(?:jpg|jpeg|png|webp|gif))/gi;
+        let match;
+        while ((match = scrapingRegex.exec(html)) !== null) {
+          addUrl(match[1]);
+        }
+      }
+
+      // If new CDN images found, return them directly
+      if (imageUrls.length > 0) {
+        const comicImages = imageUrls.map((url, idx) => ({
+          page: idx + 1,
+          url: url,
+          alt: ""
+        }));
+
+        const result = {
+          source: "jjaptoon",
+          chapter_id: parseInt(chapterId),
+          comic_title: comicTitle,
+          chapter_title: chapterTitle,
+          page_title: pageTitle,
+          total_images: comicImages.length,
+          images: comicImages
+        };
+
+        return new Response(JSON.stringify(result, null, 2), {
+          status: 200,
+          headers: { ...corsHeaders(), "Content-Type": "application/json" }
+        });
+      }
+
+      // === FALLBACK: Old title-based reconstruction ===
+      const domain = new URL(successUrl).hostname;
       const folderPath = `${comicTitle}/${chapterTitle}`;
       const encodedFolder = folderPath.split("/").map(encodeURIComponent).join("/");
-      const baseImageUrl = `https://www.jjaptoon003.com/storage/comics-imported/${encodedFolder}/`;
+      const baseImageUrl = `https://${domain}/storage/comics-imported/${encodedFolder}/`;
 
       const probeHeaders = new Headers();
       probeHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");

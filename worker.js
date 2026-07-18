@@ -44,43 +44,7 @@ export default {
       return new Response("Forbidden", { status: 403, headers: corsHeaders() });
     }
 
-    // kuaikan: dua pola URL (mobile/comics/{id} dan webs/comic-next/{id}) sama-sama chapter id
-    const kuaikanMatch = targetUrl.href.match(/kuaikanmanhua\.com\/.*?(\d{5,})/);
-    if (kuaikanMatch) {
-      const chapterId = kuaikanMatch[1];
-
-      const apiUrl = `https://m.kuaikanmanhua.com/v2/mweb/comic/${chapterId}`;
-      const apiHeaders = new Headers();
-      apiHeaders.set("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36");
-      apiHeaders.set("Accept", "application/json, text/plain, */*");
-      apiHeaders.set("Referer", "https://m.kuaikanmanhua.com/");
-      apiHeaders.set("Origin", "https://m.kuaikanmanhua.com");
-      apiHeaders.set("Sec-Fetch-Dest", "empty");
-      apiHeaders.set("Sec-Fetch-Mode", "cors");
-      apiHeaders.set("Sec-Fetch-Site", "same-origin");
-      apiHeaders.set("Sec-Ch-Ua-Mobile", "?1");
-
-      try {
-        const apiRes = await fetch(apiUrl, { method: "GET", headers: apiHeaders, redirect: "follow" });
-        const apiJson = await apiRes.json();
-        const comicInfo = apiJson?.data?.comic_info;
-        const topicInfo = apiJson?.data?.topic_info;
-        if (!comicInfo) throw new Error("Chapter not found");
-
-        return new Response(JSON.stringify({
-          source: "kuaikanmanhua", chapter_id: comicInfo.id, title: comicInfo.title,
-          cover: comicInfo.cover_image_url, is_free: comicInfo.is_free, need_vip: comicInfo.need_vip,
-          topic: topicInfo ? { id: topicInfo.id, title: topicInfo.title, author: topicInfo.user?.nickname } : null,
-          images: comicInfo.images || [],
-          comic_images: (comicInfo.comic_images || []).map(img => ({ url: img.url, width: img.width, height: img.height }))
-        }, null, 2), { status: 200, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
-      } catch (err) {
-        return new Response(JSON.stringify({ error: "Kuaikan failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
-      }
-    }
-
-    // jjaptoon: situs sudah berganti struktur (per Juli 2026) - gambar sekarang sudah langsung ada di HTML
-    // sebagai <img src="https://www.jjaptoon.vip/attachment/scraping/..."> tanpa perlu direkonstruksi/binary search lagi
+    // jjaptoon: gambar sudah ada langsung di <img src> HTML, jadi kita scrape URL-nya langsung
     const jjaptoonMatch = targetUrl.href.match(/^https?:\/\/[^/]*jjaptoon[^/]*\/chapters\/(\d+)/);
     if (jjaptoonMatch) {
       const chapterId = jjaptoonMatch[1];
@@ -128,41 +92,42 @@ export default {
         );
       }
 
-      // judul halaman berformat "{comic_title} - {comic_title} {chapter_label} - 짭툰"
-      const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+      const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
       const pageTitle = titleMatch ? titleMatch[1].trim() : "";
 
       let comicTitle = "";
       let chapterTitle = "";
 
-      const titleParts = pageTitle.split(" - ").map(p => p.trim()).filter(Boolean);
-      if (titleParts.length >= 2) {
-        comicTitle = titleParts[0];
-        // titleParts[1] biasanya "{comic_title} {chapter_label}" -> ambil sisa setelah nama komik dibuang
-        chapterTitle = titleParts[1].startsWith(comicTitle)
-          ? titleParts[1].slice(comicTitle.length).trim()
-          : titleParts[1];
-        if (!chapterTitle) chapterTitle = titleParts[1];
+      if (pageTitle.includes(" - ")) {
+        const parts = pageTitle.split(" - ");
+        comicTitle = parts[0].trim();
+        chapterTitle = parts[1].trim();
       }
 
-      // gambar chapter sudah langsung ada di HTML sebagai <img src="https://www.jjaptoon.vip/attachment/...">
-      const imgRegex = /<img\b[^>]*\bsrc="(https?:\/\/[^"]*jjaptoon[^"]*\/attachment\/[^"]+)"[^>]*>/gi;
-      const seenUrls = new Set();
-      const comicImages = [];
-      let imgMatch;
-      while ((imgMatch = imgRegex.exec(html)) !== null) {
-        const imgUrl = imgMatch[0].match(/\bsrc="([^"]+)"/i)[1];
-        if (seenUrls.has(imgUrl)) continue;
-        seenUrls.add(imgUrl);
-        comicImages.push({ page: comicImages.length + 1, url: imgUrl, alt: "" });
+      // Gambar sekarang di-render langsung di HTML (tidak lagi kosong/JS-rendered).
+      // Ada 2 pola URL yang diamati di lapangan:
+      //   1. https://www.jjaptoon.vip/comics-imported/{comic}/{chapter}/001.jpg  (predictable)
+      //   2. https://www.jjaptoon.vip/attachment/scraping/{y}/{m}/{d}/{id}.jpg  (per-image, tidak predictable)
+      // Jadi kita scrape <img> tags langsung dari HTML, bukan rekonstruksi/tebak URL.
+      const imgRegex = /<img\b[^>]*\bsrc="(https?:\/\/[^"]+\.(?:jpg|jpeg|png|webp))"[^>]*>/gi;
+      const allImgSrcs = [];
+      let m;
+      while ((m = imgRegex.exec(html)) !== null) {
+        allImgSrcs.push(m[1]);
       }
+
+      // Buang gambar non-konten (logo situs, ikon settings, dsb): konten chapter
+      // selalu ada di /comics-imported/ atau /attachment/scraping/ pada domain vip/003.com.
+      const comicImages = allImgSrcs
+        .filter(src => /\/(comics-imported|attachment\/scraping)\//i.test(src))
+        .map((url, idx) => ({ page: idx + 1, url, alt: "" }));
 
       if (comicImages.length === 0) {
         return new Response(
           JSON.stringify({
             error: "No comic images found in jjaptoon chapter page",
-            note: "Expected <img src=\"...jjaptoon.../attachment/...\"> tags. The site may have changed its markup again.",
-            debug: { chapterId, comicTitle, chapterTitle, pageTitle, url: successUrl }
+            note: "Expected <img src=\"...comics-imported/...\"> or <img src=\"...attachment/scraping/...\"> tags. The site may have changed its markup or CDN path pattern.",
+            debug: { chapterId, comicTitle, chapterTitle, pageTitle, url: successUrl, totalImgTagsFound: allImgSrcs.length }
           }),
           { status: 404, headers: { ...corsHeaders(), "Content-Type": "application/json" }}
         );
@@ -211,14 +176,12 @@ export default {
         if (!apiRes.ok) throw new Error(`HTTP ${apiRes.status}`);
         const html = await apiRes.text();
 
-        // judul halaman berformat "{chapter_title} - {comic_title} - 包子漫画"
         const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
         const pageTitle = titleMatch ? titleMatch[1].trim() : "";
         const titleParts = pageTitle.split(" - ");
         const chapterTitle = titleParts[0]?.trim() || "";
         const comicTitle = titleParts[1]?.trim() || "";
 
-        // gambar chapter dirender server-side sebagai <img class="comic-contain__item" data-src="...">
         const imgRegex = /<img\b[^>]*\bclass="comic-contain__item"[^>]*>/gi;
         const imgTags = html.match(imgRegex) || [];
 

@@ -49,10 +49,12 @@ export default {
     if (jjaptoonMatch) {
       const chapterId = jjaptoonMatch[1];
 
+      // Domain jjaptoon berubah dari waktu ke waktu (003, 004, dst). Coba URL asli dulu,
+      // baru fallback ke domain umum tanpa nomor kalau gagal.
       const urlsToTry = [
         targetUrl.toString(),
-        `https://www.jjaptoon003.com/chapters/${chapterId}`,
-        `https://jjaptoon003.com/chapters/${chapterId}`
+        `https://www.jjaptoon.com/chapters/${chapterId}`,
+        `https://jjaptoon.com/chapters/${chapterId}`
       ];
 
       let lastError = null;
@@ -105,29 +107,35 @@ export default {
       }
 
       // Gambar sekarang di-render langsung di HTML (tidak lagi kosong/JS-rendered).
-      // Ada 2 pola URL yang diamati di lapangan:
-      //   1. https://www.jjaptoon.vip/comics-imported/{comic}/{chapter}/001.jpg  (predictable)
-      //   2. https://www.jjaptoon.vip/attachment/scraping/{y}/{m}/{d}/{id}.jpg  (per-image, tidak predictable)
-      // Jadi kita scrape <img> tags langsung dari HTML, bukan rekonstruksi/tebak URL.
-      const imgRegex = /<img\b[^>]*\bsrc="(https?:\/\/[^"]+\.(?:jpg|jpeg|png|webp))"[^>]*>/gi;
-      const allImgSrcs = [];
-      let m;
-      while ((m = imgRegex.exec(html)) !== null) {
-        allImgSrcs.push(m[1]);
-      }
+      // JANGAN whitelist path CDN tertentu (comics-imported, attachment/scraping, dst) —
+      // situs ini sering ganti domain/path CDN gambar tanpa pemberitahuan. Kalau path baru
+      // muncul, whitelist lama akan salah membuang semua gambar chapter.
+      // Sebaliknya: setiap <img> di halaman ini punya alt text berpola
+      // "{judul komik} {judul chapter} {nomor halaman}" (lihat contoh di HTML asli).
+      // Itu ciri konten chapter yang stabil, apa pun domain/path file gambarnya.
+      // Logo situs, ikon UI, dsb tidak punya alt text berpola begini, jadi otomatis tersaring.
+      const imgTagRegex = /<img\b[^>]*>/gi;
+      const allImgTags = html.match(imgTagRegex) || [];
 
-      // Buang gambar non-konten (logo situs, ikon settings, dsb): konten chapter
-      // selalu ada di /comics-imported/ atau /attachment/scraping/ pada domain vip/003.com.
-      const comicImages = allImgSrcs
-        .filter(src => /\/(comics-imported|attachment\/scraping)\//i.test(src))
-        .map((url, idx) => ({ page: idx + 1, url, alt: "" }));
+      const comicImages = [];
+      let idx = 0;
+      for (const tag of allImgTags) {
+        const srcMatch = tag.match(/\bsrc="([^"]+)"/i);
+        const altMatch = tag.match(/\balt="([^"]*)"/i);
+        if (!srcMatch) continue;
+        const alt = altMatch ? altMatch[1] : "";
+        // Alt konten chapter selalu diakhiri nomor halaman (contoh: "... 182화 1", "... 182화 2")
+        if (!/\s\d+$/.test(alt.trim())) continue;
+        idx++;
+        comicImages.push({ page: idx, url: srcMatch[1], alt });
+      }
 
       if (comicImages.length === 0) {
         return new Response(
           JSON.stringify({
             error: "No comic images found in jjaptoon chapter page",
-            note: "Expected <img src=\"...comics-imported/...\"> or <img src=\"...attachment/scraping/...\"> tags. The site may have changed its markup or CDN path pattern.",
-            debug: { chapterId, comicTitle, chapterTitle, pageTitle, url: successUrl, totalImgTagsFound: allImgSrcs.length }
+            note: "Expected <img alt=\"...{page number}\"> tags matching the chapter's page numbering. The site may have changed its markup entirely (not just the CDN path).",
+            debug: { chapterId, comicTitle, chapterTitle, pageTitle, url: successUrl, totalImgTagsFound: allImgTags.length }
           }),
           { status: 404, headers: { ...corsHeaders(), "Content-Type": "application/json" }}
         );
@@ -221,6 +229,74 @@ export default {
         }, null, 2), { status: 200, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
       } catch (err) {
         return new Response(JSON.stringify({ error: "Baozimh failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
+      }
+    }
+
+    // 311s: gambar sudah langsung di <img class="comic-image" src="..."> HTML, urutan sesuai posisi di halaman
+    const s311Match = targetUrl.href.match(/^https?:\/\/[^/]*311s\.com\/chapter_(\d+)_(\d+)\.html/);
+    if (s311Match) {
+      const comicId = s311Match[1];
+      const chapterId = s311Match[2];
+
+      const s311Url = `https://www.311s.com/chapter_${comicId}_${chapterId}.html`;
+
+      const pageHeaders = new Headers();
+      pageHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
+      pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+      pageHeaders.set("Accept-Language", "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7");
+      pageHeaders.set("Referer", "https://www.311s.com/");
+
+      try {
+        const pageRes = await fetch(s311Url, { method: "GET", headers: pageHeaders, redirect: "follow" });
+        if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
+        const html = await pageRes.text();
+
+        const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+        const pageTitle = titleMatch ? titleMatch[1].trim() : "";
+        // Format title: "{comic} 阅读 - {chapter} - ..."
+        let comicTitle = "";
+        let chapterTitle = "";
+        const titleParts = pageTitle.split(" - ");
+        if (titleParts.length >= 2) {
+          comicTitle = titleParts[0].replace(/阅读\s*$/, "").trim();
+          chapterTitle = titleParts[1].trim();
+        }
+
+        const imgTagRegex = /<img\b[^>]*>/gi;
+        const allImgTags = html.match(imgTagRegex) || [];
+        const comicImages = [];
+        let idx = 0;
+        for (const tag of allImgTags) {
+          if (!/\bclass="comic-image"/i.test(tag)) continue;
+          const srcMatch = tag.match(/\bsrc="([^"]+)"/i);
+          if (!srcMatch) continue;
+          idx++;
+          comicImages.push({ page: idx, url: srcMatch[1], alt: "" });
+        }
+
+        if (comicImages.length === 0) {
+          return new Response(
+            JSON.stringify({
+              error: "No comic images found in 311s chapter page",
+              note: "Expected <img class=\"comic-image\" src=\"...\"> tags. The site may have changed its markup.",
+              debug: { comicId, chapterId, pageTitle, url: s311Url }
+            }),
+            { status: 404, headers: { ...corsHeaders(), "Content-Type": "application/json" }}
+          );
+        }
+
+        return new Response(JSON.stringify({
+          source: "311s",
+          comic_id: parseInt(comicId),
+          chapter_id: parseInt(chapterId),
+          comic_title: comicTitle,
+          chapter_title: chapterTitle,
+          page_title: pageTitle,
+          total_images: comicImages.length,
+          images: comicImages
+        }, null, 2), { status: 200, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "311s failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
       }
     }
 

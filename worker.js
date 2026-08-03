@@ -300,6 +300,98 @@ export default {
       }
     }
 
+    // manwa.me: URL gambar ada langsung di HTML (data-r-src), tapi isi filenya
+    // adalah ciphertext AES-128-CBC, bukan gambar biasa. Key & IV sama persis:
+    // "my2ecret782ecret" (statis, sudah diverifikasi lintas beberapa chapter/komik
+    // berbeda). Dua kasus ditangani di sini:
+    //   1. URL chapter (manwa.me/chapter/{id}) -> scrape halaman, balikin daftar url gambar
+    //   2. URL gambar (mwappimgs.cc/...) -> fetch ciphertext, decrypt, serve sebagai webp
+    const manwaChapterMatch = targetUrl.href.match(/^https?:\/\/(?:www\.)?manwa\.me\/chapter\/(\d+)/);
+    const manwaImageMatch = targetUrl.hostname.endsWith("mwappimgs.cc");
+
+    if (manwaChapterMatch) {
+      const chapterId = manwaChapterMatch[1];
+
+      const pageHeaders = new Headers();
+      pageHeaders.set("User-Agent", "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36");
+      pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+      pageHeaders.set("Referer", "https://manwa.me/");
+
+      try {
+        const pageRes = await fetch(targetUrl.toString(), { method: "GET", headers: pageHeaders, redirect: "follow" });
+        if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
+        const html = await pageRes.text();
+
+        const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+        const pageTitle = titleMatch ? titleMatch[1].trim() : "";
+        const titleParts = pageTitle.split(" - ");
+        const comicTitle = titleParts[0]?.trim() || "";
+        const chapterTitle = titleParts[1]?.trim() || "";
+
+        // Ambil tiap tag <img class="... content-img ... lazy_img ...">, lalu
+        // extract attribute data-r-src dari masing-masing tag itu.
+        const imgTagRegex = /<img\b[^>]*\bclass="[^"]*content-img[^"]*lazy_img[^"]*"[^>]*>/gi;
+        const imgTags = html.match(imgTagRegex) || [];
+
+        const comicImages = [];
+        let idx = 0;
+        for (const tag of imgTags) {
+          const srcMatch = tag.match(/\bdata-r-src="([^"]+)"/i);
+          if (!srcMatch) continue;
+          idx++;
+          comicImages.push({ page: idx, url: srcMatch[1] });
+        }
+
+        if (comicImages.length === 0) {
+          return new Response(
+            JSON.stringify({
+              error: "No comic images found in manwa.me chapter page",
+              note: "Expected <img class=\"content-img lazy_img\" data-r-src=\"...\"> tags. The site may have changed its markup.",
+              debug: { chapterId, pageTitle, totalImgTagsFound: imgTags.length }
+            }),
+            { status: 404, headers: { ...corsHeaders(), "Content-Type": "application/json" }}
+          );
+        }
+
+        return new Response(JSON.stringify({
+          source: "manwa",
+          chapter_id: parseInt(chapterId),
+          comic_title: comicTitle,
+          chapter_title: chapterTitle,
+          page_title: pageTitle,
+          total_images: comicImages.length,
+          images: comicImages
+        }, null, 2), { status: 200, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "manwa.me failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
+      }
+    }
+
+    if (manwaImageMatch) {
+      const imgHeaders = new Headers();
+      imgHeaders.set("User-Agent", "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36");
+      imgHeaders.set("Referer", "https://manwa.me/");
+
+      try {
+        const imgRes = await fetch(targetUrl.toString(), { method: "GET", headers: imgHeaders, redirect: "follow" });
+        if (!imgRes.ok) throw new Error(`HTTP ${imgRes.status}`);
+
+        const encryptedBuffer = await imgRes.arrayBuffer();
+
+        const MANWA_AES_KEY = "my2ecret782ecret";
+        const keyBytes = new TextEncoder().encode(MANWA_AES_KEY);
+        const cryptoKey = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-CBC" }, false, ["decrypt"]);
+        const decryptedBuffer = await crypto.subtle.decrypt({ name: "AES-CBC", iv: keyBytes }, cryptoKey, encryptedBuffer);
+
+        return new Response(decryptedBuffer, {
+          status: 200,
+          headers: { ...corsHeaders(), "Content-Type": "image/webp", "Cache-Control": "public, max-age=86400" }
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "manwa.me image decrypt failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
+      }
+    }
+
     // umum: fallback proxy generic untuk URL apa saja yang tidak dikenali di atas
     let effectiveReferer = targetUrl.origin + "/";
     let effectiveOrigin = targetUrl.origin;

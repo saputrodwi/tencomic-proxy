@@ -61,7 +61,15 @@ export default {
       let html = null;
       let successUrl = null;
 
+      // Timeout per domain: kalau satu domain jjaptoon sedang mati/lambat,
+      // jangan menunggu sampai batas timeout Cloudflare (bisa puluhan detik).
+      // Beri 8 detik per percobaan, lalu segera pindah ke domain fallback berikutnya.
+      const FETCH_TIMEOUT_MS = 8000;
+
       for (const url of urlsToTry) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
         try {
           const pageHeaders = new Headers();
           pageHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
@@ -69,7 +77,7 @@ export default {
           pageHeaders.set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7");
           pageHeaders.set("Referer", new URL(url).origin + "/");
 
-          const pageRes = await fetch(url, { method: "GET", headers: pageHeaders, redirect: "follow" });
+          const pageRes = await fetch(url, { method: "GET", headers: pageHeaders, redirect: "follow", signal: controller.signal });
 
           if (pageRes.ok) {
             html = await pageRes.text();
@@ -79,7 +87,9 @@ export default {
             lastError = `HTTP ${pageRes.status} for ${url}`;
           }
         } catch (e) {
-          lastError = e.message;
+          lastError = e.name === "AbortError" ? `Timeout (${FETCH_TIMEOUT_MS}ms) for ${url}` : e.message;
+        } finally {
+          clearTimeout(timeoutId);
         }
       }
 

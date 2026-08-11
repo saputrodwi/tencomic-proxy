@@ -1,19 +1,95 @@
+// umum: proxy dibatasi hanya untuk domain platform yang didukung + CDN gambarnya.
+// Ini mencegah endpoint dipakai sebagai open proxy publik (lihat bug #19/#20).
+// Setiap kali menambah platform baru, tambahkan juga domain halaman chapter-nya
+// DAN domain CDN gambarnya (kalau beda) di daftar ini.
+//
+// jjaptoon sengaja diperlakukan khusus: situsnya rutin pindah domain, dan
+// bukan cuma nomornya yang berubah (jjaptoon003, 004, 005, dst) — TLD-nya
+// juga ikut berganti (sudah pernah dipakai: .com, .net; kemungkinan .vip
+// juga pernah dipakai). CDN gambarnya juga ikut domain utama yang aktif
+// saat itu (misal www.jjaptoon.net/comics-imported/...). Exact-match akan
+// selalu ketinggalan kombinasi terbaru, jadi dicocokkan lewat pola yang
+// menerima nomor opsional + salah satu TLD dari daftar yang pernah teramati.
+// Kalau situsnya pindah ke TLD baru lagi di luar daftar ini, tambahkan di sini.
+const JJAPTOON_HOST_RE = /^(www\.)?jjaptoon\d*\.(com|net|vip|xyz|top|me)$/;
+
+const ALLOWED_HOST_SUFFIXES = [
+  "twmanga.com",
+  "baozimh.com",
+  "baozicdn.com",
+  "bzcdn.net",
+  "manwa.me",
+  "mwappimgs.cc",
+  "311s.com",
+  "wmanhua.com"
+];
+
+function isHostAllowed(hostname) {
+  const h = hostname.toLowerCase();
+  if (JJAPTOON_HOST_RE.test(h)) return true;
+  return ALLOWED_HOST_SUFFIXES.some((suffix) => h === suffix || h.endsWith("." + suffix));
+}
+
+// umum: batas ukuran file untuk mencegah body sangat besar menghabiskan memory
+// Worker (lihat bug #23). Dicek dari header Content-Length kalau tersedia; kalau
+// server tidak mengirim header itu, body tetap diperbolehkan lewat (kita tidak
+// bisa tahu ukurannya tanpa membaca seluruh stream lebih dulu).
+const MAX_FETCH_BYTES = 25 * 1024 * 1024; // 25 MB
+
+/**
+ * fetch() dengan redirect manual + validasi ulang setiap hop terhadap allowlist
+ * (lihat bug #21). Redirect ke domain yang tidak diizinkan akan ditolak, bukan
+ * diikuti diam-diam.
+ */
+async function safeFetch(url, options = {}, maxRedirects = 5) {
+  let currentUrl = url;
+  for (let i = 0; i <= maxRedirects; i++) {
+    const res = await fetch(currentUrl, { ...options, redirect: "manual" });
+
+    const isRedirect = res.status >= 300 && res.status < 400;
+    if (!isRedirect) {
+      const contentLength = Number(res.headers.get("content-length") || 0);
+      if (contentLength > MAX_FETCH_BYTES) {
+        throw new Error(`Response too large (${contentLength} bytes, max ${MAX_FETCH_BYTES})`);
+      }
+      return res;
+    }
+
+    const location = res.headers.get("location");
+    if (!location) return res; // redirect tanpa Location, biarkan caller yang urus
+
+    let nextUrl;
+    try {
+      nextUrl = new URL(location, currentUrl);
+    } catch {
+      throw new Error(`Invalid redirect Location: ${location}`);
+    }
+
+    if (!["http:", "https:"].includes(nextUrl.protocol) || !isHostAllowed(nextUrl.hostname)) {
+      throw new Error(`Redirect to disallowed host blocked: ${nextUrl.hostname}`);
+    }
+
+    currentUrl = nextUrl.toString();
+  }
+  throw new Error("Too many redirects");
+}
+
 export default {
   async fetch(request) {
     const reqUrl = new URL(request.url);
 
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders() });
+      return new Response(null, { status: 204, headers: corsHeaders(request) });
     }
     if (request.method === "HEAD") {
-      return new Response(null, { status: 200, headers: corsHeaders() });
+      return new Response(null, { status: 200, headers: corsHeaders(request) });
     }
 
     const target = reqUrl.searchParams.get("url") || reqUrl.searchParams.get("u");
     const referer = reqUrl.searchParams.get("referer") || reqUrl.searchParams.get("ref") || "";
 
     if (!target) {
-      return new Response("Missing ?url=", { status: 400, headers: corsHeaders() });
+      return new Response("Missing ?url=", { status: 400, headers: corsHeaders(request) });
     }
 
     let decodedTarget = target;
@@ -29,19 +105,27 @@ export default {
     try {
       targetUrl = new URL(decodedTarget);
     } catch {
-      return new Response("Invalid URL: " + decodedTarget.substring(0, 100), { status: 400, headers: corsHeaders() });
+      return new Response("Invalid URL: " + decodedTarget.substring(0, 100), { status: 400, headers: corsHeaders(request) });
     }
 
     if (!["http:", "https:"].includes(targetUrl.protocol)) {
-      return new Response("Only http/https", { status: 400, headers: corsHeaders() });
+      return new Response("Only http/https", { status: 400, headers: corsHeaders(request) });
     }
 
-    // umum: proteksi SSRF
+    // umum: proteksi SSRF — blok alamat internal terlebih dulu
     const hostname = targetUrl.hostname.toLowerCase();
     if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "0.0.0.0" || hostname === "::1" ||
         /^10\./.test(hostname) || /^192\.168\./.test(hostname) || /^172\.(1[6-9]|2\d|3[01])\./.test(hostname) ||
         hostname.endsWith(".internal") || hostname.endsWith(".local")) {
-      return new Response("Forbidden", { status: 403, headers: corsHeaders() });
+      return new Response("Forbidden", { status: 403, headers: corsHeaders(request) });
+    }
+
+    // umum: proxy dibatasi hanya untuk domain platform yang didukung + CDN gambarnya
+    if (!isHostAllowed(hostname)) {
+      return new Response(
+        JSON.stringify({ error: "Host not allowed", hostname }),
+        { status: 403, headers: { ...corsHeaders(request), "Content-Type": "application/json" } }
+      );
     }
 
     // jjaptoon: gambar sudah ada langsung di <img src> HTML, jadi kita scrape URL-nya langsung
@@ -77,7 +161,7 @@ export default {
           pageHeaders.set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7");
           pageHeaders.set("Referer", new URL(url).origin + "/");
 
-          const pageRes = await fetch(url, { method: "GET", headers: pageHeaders, redirect: "follow", signal: controller.signal });
+          const pageRes = await safeFetch(url, { method: "GET", headers: pageHeaders, signal: controller.signal });
 
           if (pageRes.ok) {
             html = await pageRes.text();
@@ -100,7 +184,7 @@ export default {
             detail: lastError || "All URLs failed",
             tried: urlsToTry
           }),
-          { status: 404, headers: { ...corsHeaders(), "Content-Type": "application/json" }}
+          { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
         );
       }
 
@@ -147,7 +231,7 @@ export default {
             note: "Expected <img alt=\"...{page number}\"> tags matching the chapter's page numbering. The site may have changed its markup entirely (not just the CDN path).",
             debug: { chapterId, comicTitle, chapterTitle, pageTitle, url: successUrl, totalImgTagsFound: allImgTags.length }
           }),
-          { status: 404, headers: { ...corsHeaders(), "Content-Type": "application/json" }}
+          { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
         );
       }
 
@@ -167,7 +251,7 @@ export default {
 
       return new Response(JSON.stringify(result, null, 2), {
         status: 200,
-        headers: { ...corsHeaders(), "Content-Type": "application/json" }
+        headers: { ...corsHeaders(request), "Content-Type": "application/json" }
       });
     }
 
@@ -190,7 +274,7 @@ export default {
       baoziHeaders.set("Connection", "Keep-Alive");
 
       try {
-        const apiRes = await fetch(apiUrl, { method: "GET", headers: baoziHeaders, redirect: "follow" });
+        const apiRes = await safeFetch(apiUrl, { method: "GET", headers: baoziHeaders });
         if (!apiRes.ok) throw new Error(`HTTP ${apiRes.status}`);
         const html = await apiRes.text();
 
@@ -223,7 +307,7 @@ export default {
               note: "Expected <img class=\"comic-contain__item\" data-src=\"...\"> tags. The site may have changed its markup.",
               debug: { comicSlug, chapterFile, pageTitle, apiUrl }
             }),
-            { status: 404, headers: { ...corsHeaders(), "Content-Type": "application/json" }}
+            { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
           );
         }
 
@@ -236,9 +320,9 @@ export default {
           page_title: pageTitle,
           total_images: comicImages.length,
           images: comicImages
-        }, null, 2), { status: 200, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
+        }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
       } catch (err) {
-        return new Response(JSON.stringify({ error: "Baozimh failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
+        return new Response(JSON.stringify({ error: "Baozimh failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
       }
     }
 
@@ -257,7 +341,7 @@ export default {
       pageHeaders.set("Referer", "https://www.311s.com/");
 
       try {
-        const pageRes = await fetch(s311Url, { method: "GET", headers: pageHeaders, redirect: "follow" });
+        const pageRes = await safeFetch(s311Url, { method: "GET", headers: pageHeaders });
         if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
         const html = await pageRes.text();
 
@@ -291,7 +375,7 @@ export default {
               note: "Expected <img class=\"comic-image\" src=\"...\"> tags. The site may have changed its markup.",
               debug: { comicId, chapterId, pageTitle, url: s311Url }
             }),
-            { status: 404, headers: { ...corsHeaders(), "Content-Type": "application/json" }}
+            { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
           );
         }
 
@@ -304,9 +388,9 @@ export default {
           page_title: pageTitle,
           total_images: comicImages.length,
           images: comicImages
-        }, null, 2), { status: 200, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
+        }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
       } catch (err) {
-        return new Response(JSON.stringify({ error: "311s failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
+        return new Response(JSON.stringify({ error: "311s failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
       }
     }
 
@@ -328,7 +412,7 @@ export default {
       pageHeaders.set("Referer", "https://manwa.me/");
 
       try {
-        const pageRes = await fetch(targetUrl.toString(), { method: "GET", headers: pageHeaders, redirect: "follow" });
+        const pageRes = await safeFetch(targetUrl.toString(), { method: "GET", headers: pageHeaders });
         if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
         const html = await pageRes.text();
 
@@ -359,7 +443,7 @@ export default {
               note: "Expected <img class=\"content-img lazy_img\" data-r-src=\"...\"> tags. The site may have changed its markup.",
               debug: { chapterId, pageTitle, totalImgTagsFound: imgTags.length }
             }),
-            { status: 404, headers: { ...corsHeaders(), "Content-Type": "application/json" }}
+            { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
           );
         }
 
@@ -371,9 +455,9 @@ export default {
           page_title: pageTitle,
           total_images: comicImages.length,
           images: comicImages
-        }, null, 2), { status: 200, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
+        }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
       } catch (err) {
-        return new Response(JSON.stringify({ error: "manwa.me failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
+        return new Response(JSON.stringify({ error: "manwa.me failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
       }
     }
 
@@ -383,7 +467,7 @@ export default {
       imgHeaders.set("Referer", "https://manwa.me/");
 
       try {
-        const imgRes = await fetch(targetUrl.toString(), { method: "GET", headers: imgHeaders, redirect: "follow" });
+        const imgRes = await safeFetch(targetUrl.toString(), { method: "GET", headers: imgHeaders });
         if (!imgRes.ok) throw new Error(`HTTP ${imgRes.status}`);
 
         const encryptedBuffer = await imgRes.arrayBuffer();
@@ -395,10 +479,10 @@ export default {
 
         return new Response(decryptedBuffer, {
           status: 200,
-          headers: { ...corsHeaders(), "Content-Type": "image/webp", "Cache-Control": "public, max-age=86400" }
+          headers: { ...corsHeaders(request), "Content-Type": "image/webp", "Cache-Control": "public, max-age=86400" }
         });
       } catch (err) {
-        return new Response(JSON.stringify({ error: "manwa.me image decrypt failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
+        return new Response(JSON.stringify({ error: "manwa.me image decrypt failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
       }
     }
 
@@ -420,7 +504,7 @@ export default {
       pageHeaders.set("Referer", "https://www.wmanhua.com/");
 
       try {
-        const pageRes = await fetch(targetUrl.toString(), { method: "GET", headers: pageHeaders, redirect: "follow" });
+        const pageRes = await safeFetch(targetUrl.toString(), { method: "GET", headers: pageHeaders });
         if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
         const html = await pageRes.text();
 
@@ -434,7 +518,7 @@ export default {
               note: "Expected `var num = eval(\"...\")` and `var pasd = \"...\"` in the page script. The site may have changed its markup.",
               debug: { comicId, chapterId }
             }),
-            { status: 404, headers: { ...corsHeaders(), "Content-Type": "application/json" }}
+            { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
           );
         }
 
@@ -445,7 +529,7 @@ export default {
         if (!Number.isFinite(pageCount) || pageCount <= 0) {
           return new Response(
             JSON.stringify({ error: "Invalid page count parsed from wmanhua chapter page", detail: numMatch[1] }),
-            { status: 502, headers: { ...corsHeaders(), "Content-Type": "application/json" }}
+            { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
           );
         }
 
@@ -481,9 +565,9 @@ export default {
           page_title: pageTitle,
           total_images: comicImages.length,
           images: comicImages
-        }, null, 2), { status: 200, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
+        }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
       } catch (err) {
-        return new Response(JSON.stringify({ error: "wmanhua failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
+        return new Response(JSON.stringify({ error: "wmanhua failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
       }
     }
 
@@ -499,24 +583,39 @@ export default {
     headers.set("Origin", effectiveOrigin);
 
     try {
-      const response = await fetch(targetUrl.toString(), { method: "GET", headers, redirect: "follow" });
+      const response = await safeFetch(targetUrl.toString(), { method: "GET", headers });
       const responseHeaders = new Headers(response.headers);
-      responseHeaders.set("Access-Control-Allow-Origin", "*");
-      responseHeaders.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS,HEAD");
-      responseHeaders.set("Access-Control-Allow-Headers", "*");
+      const cors = corsHeaders(request);
+      responseHeaders.set("Access-Control-Allow-Origin", cors["Access-Control-Allow-Origin"]);
+      responseHeaders.set("Access-Control-Allow-Methods", cors["Access-Control-Allow-Methods"]);
+      responseHeaders.set("Access-Control-Allow-Headers", cors["Access-Control-Allow-Headers"]);
       responseHeaders.set("Cross-Origin-Resource-Policy", "cross-origin");
       responseHeaders.delete("content-security-policy");
       responseHeaders.delete("x-frame-options");
       return new Response(response.body, { status: response.status, statusText: response.statusText, headers: responseHeaders });
     } catch (error) {
-      return new Response("Proxy error: " + error.message, { status: 502, headers: corsHeaders() });
+      return new Response("Proxy error: " + error.message, { status: 502, headers: corsHeaders(request) });
     }
   }
 };
 
-function corsHeaders() {
+// umum: jika frontend sudah punya domain tetap, isi di sini untuk membatasi CORS
+// (lihat bug #22). Biarkan null untuk tetap mengizinkan semua origin ("*").
+//
+// Diisi ke domain Netlify saat ini. Kalau nanti pindah project Netlify (nama
+// project berubah) atau pindah ke domain custom, update nilai ini juga —
+// kalau lupa, gejalanya frontend sendiri ikut kena blokir CORS (bukan cuma
+// web orang lain).
+const ALLOWED_ORIGIN = "https://trialfetch.netlify.app";
+
+function corsHeaders(request) {
+  let allowOrigin = "*";
+  if (ALLOWED_ORIGIN && request) {
+    const origin = request.headers.get("Origin") || "";
+    allowOrigin = origin === ALLOWED_ORIGIN ? origin : ALLOWED_ORIGIN;
+  }
   return {
-    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS,HEAD",
     "Access-Control-Allow-Headers": "*",
     "Access-Control-Expose-Headers": "*",

@@ -402,6 +402,91 @@ export default {
       }
     }
 
+    // wmanhua.com: tidak ada enkripsi/signing sama sekali. Chapter HTML embed dua
+    // variabel JS polos: `var num = eval("239")` (total halaman, isinya cuma angka
+    // literal, eval() di sini kosmetik) dan `var pasd = "https://.../{uuid}/"` (base
+    // folder gambar chapter ini). URL gambar tinggal `${pasd}${i}.webp` untuk i=1..num.
+    // URL-nya TIDAK signed/expiring, beda dari CDN manwa/dumanwu — jadi aman dipakai
+    // kapan saja setelah di-resolve, tidak perlu buru-buru.
+    const wmanhuaMatch = targetUrl.href.match(/^https?:\/\/(?:www\.)?wmanhua\.com\/chapter\/(\d+)-(\d+)\.html/i);
+    if (wmanhuaMatch) {
+      const comicId = wmanhuaMatch[1];
+      const chapterId = wmanhuaMatch[2];
+
+      const pageHeaders = new Headers();
+      pageHeaders.set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
+      pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+      pageHeaders.set("Accept-Language", "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7");
+      pageHeaders.set("Referer", "https://www.wmanhua.com/");
+
+      try {
+        const pageRes = await fetch(targetUrl.toString(), { method: "GET", headers: pageHeaders, redirect: "follow" });
+        if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
+        const html = await pageRes.text();
+
+        const numMatch = html.match(/var\s+num\s*=\s*eval\(\s*["'](\d+)["']\s*\)/);
+        const pasdMatch = html.match(/var\s+pasd\s*=\s*["']([^"']+)["']/);
+
+        if (!numMatch || !pasdMatch) {
+          return new Response(
+            JSON.stringify({
+              error: "No comic images found in wmanhua chapter page",
+              note: "Expected `var num = eval(\"...\")` and `var pasd = \"...\"` in the page script. The site may have changed its markup.",
+              debug: { comicId, chapterId }
+            }),
+            { status: 404, headers: { ...corsHeaders(), "Content-Type": "application/json" }}
+          );
+        }
+
+        const pageCount = parseInt(numMatch[1], 10);
+        let baseUrl = pasdMatch[1];
+        if (!baseUrl.endsWith("/")) baseUrl += "/";
+
+        if (!Number.isFinite(pageCount) || pageCount <= 0) {
+          return new Response(
+            JSON.stringify({ error: "Invalid page count parsed from wmanhua chapter page", detail: numMatch[1] }),
+            { status: 502, headers: { ...corsHeaders(), "Content-Type": "application/json" }}
+          );
+        }
+
+        const titleMatch = html.match(/<title>\s*([\s\S]*?)\s*<\/title>/i);
+        const h1Match = html.match(/<h1[^>]*>\s*([\s\S]*?)\s*<\/h1>/i);
+        const rawTitle = (titleMatch && titleMatch[1]) || (h1Match && h1Match[1]) || "";
+        const pageTitle = rawTitle.replace(/\s*\|\s*W漫画\s*$/i, "").replace(/\s+/g, " ").trim();
+
+        // Format title: "{chapter} {comic} - ..."
+        let comicTitle = "";
+        let chapterTitle = "";
+        const titleParts = pageTitle.split(" - ");
+        const firstPart = (titleParts[0] || "").trim();
+        const spaceIdx = firstPart.indexOf(" ");
+        if (spaceIdx > -1) {
+          chapterTitle = firstPart.slice(0, spaceIdx).trim();
+          comicTitle = firstPart.slice(spaceIdx + 1).trim();
+        } else {
+          chapterTitle = firstPart;
+        }
+
+        const comicImages = Array.from({ length: pageCount }, (_, i) => ({
+          page: i + 1,
+          url: `${baseUrl}${i + 1}.webp`
+        }));
+
+        return new Response(JSON.stringify({
+          source: "wmanhua",
+          comic_id: parseInt(comicId),
+          chapter_id: parseInt(chapterId),
+          comic_title: comicTitle,
+          chapter_title: chapterTitle,
+          page_title: pageTitle,
+          total_images: comicImages.length,
+          images: comicImages
+        }, null, 2), { status: 200, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "wmanhua failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(), "Content-Type": "application/json" }});
+      }
+    }
+
     // umum: fallback proxy generic untuk URL apa saja yang tidak dikenali di atas
     let effectiveReferer = targetUrl.origin + "/";
     let effectiveOrigin = targetUrl.origin;

@@ -2,7 +2,7 @@
 // Ini mencegah endpoint dipakai sebagai open proxy publik (lihat bug #19/#20).
 // Setiap kali menambah platform baru, tambahkan juga domain halaman chapter-nya
 // DAN domain CDN gambarnya (kalau beda) di daftar ini.
-//
+// Tidak ada
 // jjaptoon sengaja diperlakukan khusus: situsnya rutin pindah domain, dan
 // bukan cuma nomornya yang berubah (jjaptoon003, 004, 005, dst) — TLD-nya
 // juga ikut berganti (sudah pernah dipakai: .com, .net; kemungkinan .vip
@@ -20,8 +20,9 @@ const ALLOWED_HOST_SUFFIXES = [
   "bzcdn.net",
   "manwa.me",
   "mwappimgs.cc",
-  "311s.com",
-  "wmanhua.com"
+  "wmanhua.com",
+  "koudaimh.com",
+  "shimolife.com"
 ];
 
 function isHostAllowed(hostname) {
@@ -30,57 +31,224 @@ function isHostAllowed(hostname) {
   return ALLOWED_HOST_SUFFIXES.some((suffix) => h === suffix || h.endsWith("." + suffix));
 }
 
+// umum: rate limiting sederhana per-IP (lihat bug #2g — sebelumnya siapa
+// pun bisa memakai endpoint tanpa batas, membebani kuota Worker maupun
+// situs sumber). Ini in-memory (bukan KV/Durable Objects), jadi PENTING
+// dipahami keterbatasannya:
+//   - counter hilang tiap kali Worker instance di-restart/di-scale ulang
+//     oleh Cloudflare — bukan hitungan yang benar-benar akurat/permanen;
+//   - tiap instance/lokasi edge Cloudflare punya counter sendiri-sendiri
+//     (tidak shared global), jadi limit efektif per pengguna bisa lebih
+//     longgar dari angka yang tertulis di sini kalau request tersebar ke
+//     banyak edge location;
+//   - ini lapisan pertama yang menahan abuse KASAR (script yang spam
+//     ratusan request per detik dari IP yang sama), bukan proteksi kuat
+//     terhadap penyalahgunaan terdistribusi/serius. Untuk itu perlu
+//     Durable Objects, KV dengan TTL, atau Cloudflare Rate Limiting Rules
+//     di level dashboard (lebih akurat, tapi butuh setup terpisah).
+const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000; 
+const RATE_LIMIT_MAX_REQUESTS = 500; // per IP per window
+const rateLimitBuckets = new Map(); // ip -> { count, windowStart }
+
+function checkRateLimit(ip) {
+  const now = Date.now();
+  const bucket = rateLimitBuckets.get(ip);
+
+  if (!bucket || now - bucket.windowStart >= RATE_LIMIT_WINDOW_MS) {
+    rateLimitBuckets.set(ip, { count: 1, windowStart: now });
+    return true;
+  }
+
+  bucket.count++;
+  if (bucket.count > RATE_LIMIT_MAX_REQUESTS) {
+    return false;
+  }
+  return true;
+}
+
+// Bersihkan bucket lama sesekali supaya Map tidak tumbuh tanpa batas kalau
+// Worker instance-nya hidup lama (banyak IP unik numpuk di memori).
+let lastRateLimitCleanup = Date.now();
+function cleanupRateLimitBuckets() {
+  const now = Date.now();
+  if (now - lastRateLimitCleanup < RATE_LIMIT_WINDOW_MS) return;
+  lastRateLimitCleanup = now;
+  for (const [ip, bucket] of rateLimitBuckets) {
+    if (now - bucket.windowStart >= RATE_LIMIT_WINDOW_MS) {
+      rateLimitBuckets.delete(ip);
+    }
+  }
+}
+
 // umum: batas ukuran file untuk mencegah body sangat besar menghabiskan memory
-// Worker (lihat bug #23). Dicek dari header Content-Length kalau tersedia; kalau
-// server tidak mengirim header itu, body tetap diperbolehkan lewat (kita tidak
-// bisa tahu ukurannya tanpa membaca seluruh stream lebih dulu).
+// Worker (lihat bug #23).
 const MAX_FETCH_BYTES = 25 * 1024 * 1024; // 25 MB
+
+/**
+ * Membungkus response.body dengan TransformStream yang menghitung byte
+ * secara real-time saat stream dibaca, dan menghentikan aliran begitu
+ * melebihi maxBytes — bukan cuma percaya header Content-Length (yang bisa
+ * tidak ada sama sekali kalau origin pakai chunked transfer, atau mewakili
+ * ukuran terkompresi yang beda dari ukuran aktual setelah decompress).
+ * Body baru benar-benar "membesar" saat caller memanggil .text()/
+ * .arrayBuffer()/.json() — enforcement di titik itu (lewat stream), bukan
+ * di titik fetch, supaya efektif untuk semua kasus di atas.
+ */
+function limitResponseSize(response, maxBytes) {
+  if (!response.body) return response;
+
+  let received = 0;
+  const limited = new TransformStream({
+    transform(chunk, controller) {
+      received += chunk.byteLength;
+      if (received > maxBytes) {
+        controller.error(new Error(`Response too large (exceeded ${maxBytes} bytes while streaming)`));
+        return;
+      }
+      controller.enqueue(chunk);
+    }
+  });
+
+  const newBody = response.body.pipeThrough(limited);
+  return new Response(newBody, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers
+  });
+}
+
+// umum: timeout default untuk subrequest yang tidak menyediakan AbortSignal
+// sendiri (lihat bug #2f — sebelumnya cuma handler chapter jjaptoon yang
+// punya timeout, 9 titik fetch lain tidak punya sama sekali dan bisa
+// menahan Worker selama origin lambat merespons).
+const DEFAULT_FETCH_TIMEOUT_MS = 15000;
+
+// umum: header yang isinya spesifik untuk origin tertentu (misal kredensial
+// app baozimh) — kalau redirect berpindah origin, header-header ini harus
+// dilepas dan dibangun ulang, bukan diteruskan mentah ke origin baru yang
+// mungkin tidak seharusnya menerimanya (lihat bug #2d).
+const ORIGIN_SPECIFIC_HEADERS = ["origin", "referer", "app-id", "device-code", "device-id", "app-version", "cookie", "authorization"];
 
 /**
  * fetch() dengan redirect manual + validasi ulang setiap hop terhadap allowlist
  * (lihat bug #21). Redirect ke domain yang tidak diizinkan akan ditolak, bukan
- * diikuti diam-diam.
+ * diikuti diam-diam. Body response non-redirect dibungkus limitResponseSize()
+ * supaya batas ukuran ditegakkan lewat streaming aktual, bukan cuma header.
+ * Kalau caller tidak mengirim `signal` sendiri di options, dipasang timeout
+ * default di sini supaya semua handler otomatis terlindungi tanpa perlu
+ * ditambahkan satu-satu.
+ *
+ * Semantik redirect mengikuti spek HTTP (lihat bug #2c), bukan asal mengulang
+ * method+body yang sama di setiap hop:
+ *   - 303 selalu didowngrade ke GET tanpa body, apa pun method aslinya;
+ *   - 301/302 untuk method selain GET/HEAD didowngrade ke GET tanpa body
+ *     (ini juga perilaku browser/fetch spec modern, walau standar lama
+ *     mengizinkan mempertahankan method untuk 301/302);
+ *   - 307/308 WAJIB mempertahankan method dan body persis seperti request
+ *     asal — tidak didowngrade.
+ * Header yang origin-spesifik (lihat ORIGIN_SPECIFIC_HEADERS) dilepas dan
+ * dibangun ulang setiap kali redirect berpindah origin.
  */
 async function safeFetch(url, options = {}, maxRedirects = 5) {
-  let currentUrl = url;
-  for (let i = 0; i <= maxRedirects; i++) {
-    const res = await fetch(currentUrl, { ...options, redirect: "manual" });
+  const hasOwnSignal = !!options.signal;
+  const timeoutController = hasOwnSignal ? null : new AbortController();
+  const timeoutId = timeoutController
+    ? setTimeout(() => timeoutController.abort(), DEFAULT_FETCH_TIMEOUT_MS)
+    : null;
 
-    const isRedirect = res.status >= 300 && res.status < 400;
-    if (!isRedirect) {
-      const contentLength = Number(res.headers.get("content-length") || 0);
-      if (contentLength > MAX_FETCH_BYTES) {
-        throw new Error(`Response too large (${contentLength} bytes, max ${MAX_FETCH_BYTES})`);
+  try {
+    let currentUrl = url;
+    let currentMethod = options.method || "GET";
+    let currentBody = options.body;
+    let currentHeaders = options.headers instanceof Headers
+      ? new Headers(options.headers)
+      : new Headers(options.headers || {});
+    const originalOrigin = new URL(url).origin;
+
+    for (let i = 0; i <= maxRedirects; i++) {
+      let res;
+      try {
+        res = await fetch(currentUrl, {
+          method: currentMethod,
+          headers: currentHeaders,
+          body: currentBody,
+          redirect: "manual",
+          signal: hasOwnSignal ? options.signal : timeoutController.signal
+        });
+      } catch (err) {
+        if (err.name === "AbortError" && !hasOwnSignal) {
+          throw new Error(`Request timed out after ${DEFAULT_FETCH_TIMEOUT_MS}ms: ${currentUrl}`);
+        }
+        throw err;
       }
-      return res;
+
+      const isRedirect = res.status >= 300 && res.status < 400;
+      if (!isRedirect) {
+        return limitResponseSize(res, MAX_FETCH_BYTES);
+      }
+
+      // Body response redirect tidak dipakai — dibatalkan supaya koneksi
+      // segera dilepas, bukan dibiarkan menggantung (lihat bug 2e).
+      if (res.body) { try { await res.body.cancel(); } catch {} }
+
+      const location = res.headers.get("location");
+      if (!location) return res; // redirect tanpa Location, biarkan caller yang urus
+
+      let nextUrl;
+      try {
+        nextUrl = new URL(location, currentUrl);
+      } catch {
+        throw new Error(`Invalid redirect Location: ${location}`);
+      }
+
+      if (!["http:", "https:"].includes(nextUrl.protocol) || !isHostAllowed(nextUrl.hostname)) {
+        throw new Error(`Redirect to disallowed host blocked: ${nextUrl.hostname}`);
+      }
+
+      // Semantik method/body sesuai status code (lihat bug #2c).
+      if (res.status === 303 || ((res.status === 301 || res.status === 302) && !["GET", "HEAD"].includes(currentMethod))) {
+        currentMethod = "GET";
+        currentBody = undefined;
+        currentHeaders.delete("content-type");
+      }
+      // 307/308: method dan body sengaja TIDAK diubah sama sekali.
+
+      // Origin berubah -> lepas header origin-spesifik, bangun ulang
+      // Referer/Origin sesuai origin baru (lihat bug #2d).
+      if (nextUrl.origin !== originalOrigin) {
+        for (const h of ORIGIN_SPECIFIC_HEADERS) currentHeaders.delete(h);
+        currentHeaders.set("Referer", nextUrl.origin + "/");
+        currentHeaders.set("Origin", nextUrl.origin);
+      }
+
+      currentUrl = nextUrl.toString();
     }
-
-    const location = res.headers.get("location");
-    if (!location) return res; // redirect tanpa Location, biarkan caller yang urus
-
-    let nextUrl;
-    try {
-      nextUrl = new URL(location, currentUrl);
-    } catch {
-      throw new Error(`Invalid redirect Location: ${location}`);
-    }
-
-    if (!["http:", "https:"].includes(nextUrl.protocol) || !isHostAllowed(nextUrl.hostname)) {
-      throw new Error(`Redirect to disallowed host blocked: ${nextUrl.hostname}`);
-    }
-
-    currentUrl = nextUrl.toString();
+    throw new Error("Too many redirects");
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
   }
-  throw new Error("Too many redirects");
 }
 
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     const reqUrl = new URL(request.url);
 
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders(request) });
     }
+
+    // Rate limit dicek sebelum logic lain (kecuali OPTIONS preflight, yang
+    // otomatis dikirim browser tiap request CORS sungguhan dan bukan
+    // permintaan terpisah dari pengguna) — lihat bug #2g.
+    cleanupRateLimitBuckets();
+    const clientIp = request.headers.get("CF-Connecting-IP") || "unknown";
+    if (!checkRateLimit(clientIp)) {
+      return new Response(
+        JSON.stringify({ error: "Too many requests", detail: `Limit: ${RATE_LIMIT_MAX_REQUESTS} requests per ${RATE_LIMIT_WINDOW_MS / 1000}s` }),
+        { status: 429, headers: { ...corsHeaders(request), "Content-Type": "application/json", "Retry-After": String(RATE_LIMIT_WINDOW_MS / 1000) } }
+      );
+    }
+
     if (request.method === "HEAD") {
       return new Response(null, { status: 200, headers: corsHeaders(request) });
     }
@@ -255,6 +423,76 @@ export default {
       });
     }
 
+    // jjaptoon: URL SERIES (bukan chapter). Halaman series (Livewire/PHP,
+    // server-side rendered) menampilkan SEMUA chapter langsung di satu
+    // halaman HTML — sudah diverifikasi manual pakai sampel 49 chapter dan
+    // 193 chapter, keduanya cocok persis dengan jumlah "총 N화" yang
+    // tertulis di halaman, tanpa pagination/load-more dan tanpa duplikat
+    // (beda dari wmanhua yang butuh API terpisah, dan baozimh yang render
+    // dobel). Tiap chapter link berpola:
+    //   <a href="/chapters/{id}" data-chapter-list-id="{id}" ...>
+    //     ...<p class="truncate text-sm font-black text-zinc-100">{judul}</p>
+    // Domain jjaptoon sering berganti (003, 005, dst, dan bisa juga TLD
+    // beda) — dicocokkan lewat pola generik yang sama dengan handler
+    // chapter di atas, bukan hardcode satu domain.
+    //
+    // Catatan: format judul chapter TIDAK seragam (kadang pakai judul komik
+    // di depan, kadang cuma nomor, kadang ada prefix angka lama seperti
+    // "0037 - 37화 : ..."), tapi semua format itu tetap punya digit yang
+    // konsisten dengan nomor chapter aslinya, jadi tidak perlu normalisasi
+    // khusus di sini — biarkan title apa adanya, ekstraksi nomor (kalau
+    // dibutuhkan fitur rentang) sudah ditangani generik di sisi frontend.
+    const jjaptoonSeriesMatch = targetUrl.href.match(/^https?:\/\/[^/]*jjaptoon[^/]*\/comics\/(\d+)/);
+    if (jjaptoonSeriesMatch) {
+      const comicId = jjaptoonSeriesMatch[1];
+
+      const pageHeaders = new Headers();
+      pageHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
+      pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+      pageHeaders.set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7");
+      pageHeaders.set("Referer", targetUrl.origin + "/");
+
+      try {
+        const pageRes = await safeFetch(targetUrl.toString(), { method: "GET", headers: pageHeaders });
+        if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
+        const html = await pageRes.text();
+
+        const chapterLinkRe = /href="\/chapters\/(\d+)"[^>]*data-chapter-list-id="\d+"[\s\S]*?<p class="truncate text-sm font-black text-zinc-100">([^<]+)<\/p>/g;
+
+        const chapters = [];
+        let m;
+        while ((m = chapterLinkRe.exec(html)) !== null) {
+          const [, chapterId, title] = m;
+          chapters.push({
+            chapter_id: chapterId,
+            chapter_title: title.trim(),
+            url: `${targetUrl.origin}/chapters/${chapterId}`
+          });
+        }
+
+        if (chapters.length === 0) {
+          return new Response(
+            JSON.stringify({
+              error: "No chapters found in jjaptoon series page",
+              note: "Expected <a href=\"/chapters/{id}\" data-chapter-list-id=\"...\"> links with a following <p class=\"truncate text-sm font-black text-zinc-100\"> title. The site may have changed its markup.",
+              debug: { comicId }
+            }),
+            { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
+          );
+        }
+
+        return new Response(JSON.stringify({
+          source: "jjaptoon",
+          type: "series",
+          comic_id: comicId,
+          total_chapters: chapters.length,
+          chapters
+        }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "jjaptoon series fetch failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      }
+    }
+
     // baozimh/twmanga: chapter diakses lewat www.twmanga.com, tapi datanya diambil dari app.baozimh.com pakai header app khusus
     const baoziMatch = targetUrl.href.match(/(?:twmanga\.com|baozimh\.com)\/(?:comic\/chapter|baozimhapp\/comic\/chapter)\/([^/]+)\/([^/?#]+)\.html/);
     if (baoziMatch) {
@@ -263,13 +501,31 @@ export default {
 
       const apiUrl = `https://app.baozimh.com/baozimhapp/comic/chapter/${comicSlug}/${chapterFile}.html`;
 
+      // Kredensial app baozimh WAJIB diisi lewat Cloudflare environment
+      // variable (Settings > Variables and Secrets di dashboard Worker) —
+      // tidak ada fallback nilai literal di sini secara sengaja, supaya
+      // file ini tetap bersih dari kredensial apa pun meski dibagikan.
+      // Kalau salah satu env var belum di-set, request ditolak dini dengan
+      // pesan jelas, bukan diam-diam gagal di tengah proses fetch.
+      const requiredBaoziEnvKeys = ["BAOZI_APP_ID", "BAOZI_DEVICE_CODE", "BAOZI_DEVICE_ID", "BAOZI_USER_AGENT", "BAOZI_APP_VERSION"];
+      const missingBaoziEnvKeys = requiredBaoziEnvKeys.filter((key) => !env || !env[key]);
+      if (missingBaoziEnvKeys.length > 0) {
+        return new Response(
+          JSON.stringify({
+            error: "Baozimh worker misconfigured",
+            detail: `Missing environment variable(s): ${missingBaoziEnvKeys.join(", ")}. Set them in Cloudflare Worker Settings > Variables and Secrets.`
+          }),
+          { status: 500, headers: { ...corsHeaders(request), "Content-Type": "application/json" } }
+        );
+      }
+
       const baoziHeaders = new Headers();
       baoziHeaders.set("Referer", "https://appgb.baozimh.com/");
-      baoziHeaders.set("app-id", "cn.sts.xiaoyun.ordermeals");
-      baoziHeaders.set("device-code", "6ca052067aa9833084daaa6ffeba0913");
-      baoziHeaders.set("device-id", "RKQ1.201217.002");
-      baoziHeaders.set("user-agent", "baozimh_android/1.0.31/gb/adset");
-      baoziHeaders.set("app-version", "1.0.31");
+      baoziHeaders.set("app-id", env.BAOZI_APP_ID);
+      baoziHeaders.set("device-code", env.BAOZI_DEVICE_CODE);
+      baoziHeaders.set("device-id", env.BAOZI_DEVICE_ID);
+      baoziHeaders.set("user-agent", env.BAOZI_USER_AGENT);
+      baoziHeaders.set("app-version", env.BAOZI_APP_VERSION);
       baoziHeaders.set("Accept-Encoding", "gzip");
       baoziHeaders.set("Connection", "Keep-Alive");
 
@@ -326,71 +582,82 @@ export default {
       }
     }
 
-    // 311s: gambar sudah langsung di <img class="comic-image" src="..."> HTML, urutan sesuai posisi di halaman
-    const s311Match = targetUrl.href.match(/^https?:\/\/[^/]*311s\.com\/chapter_(\d+)_(\d+)\.html/);
-    if (s311Match) {
-      const comicId = s311Match[1];
-      const chapterId = s311Match[2];
-
-      const s311Url = `https://www.311s.com/chapter_${comicId}_${chapterId}.html`;
+    // baozimh: URL SERIES (bukan chapter). Halaman series adalah AMP page
+    // yang server-side rendered, jadi daftar chapter sudah langsung ada di
+    // HTML, tidak perlu API terpisah seperti wmanhua. Tiap link chapter
+    // berpola:
+    //   /user/page_direct?comic_id={slug}&section_slot={S}&chapter_slot={C}
+    // yang mengarah ke halaman chapter format:
+    //   twmanga.com/comic/chapter/{slug}/{S}_{C}.html
+    // (sudah dikenali handler chapter di atas, yang otomatis redirect ke
+    // app.baozimh.com — jadi tidak perlu khawatir soal chapter panjang
+    // terpotong per 50 gambar, itu cuma masalah kalau scraping twmanga
+    // langsung tanpa lewat app.baozimh.com).
+    //
+    // PENTING: HTML-nya merender link chapter DUA KALI (kemungkinan preview
+    // "chapter terbaru" + daftar lengkap), jadi WAJIB dedupe berdasarkan
+    // (section_slot, chapter_slot) sebelum dipakai, dan diurutkan ulang
+    // secara eksplisit (bukan andalkan urutan HTML apa adanya, yang
+    // ternyata tidak selalu strictly berurutan) — sudah diverifikasi
+    // manual pakai sampel 402-chapter, hasilnya tetap benar setelah
+    // dedupe+sort meski HTML mentahnya berantakan.
+    const baoziSeriesMatch = targetUrl.href.match(/^https?:\/\/(?:www\.)?baozimh\.com\/comic\/([^/?#]+)\/?$/i);
+    if (baoziSeriesMatch) {
+      const comicSlug = baoziSeriesMatch[1];
 
       const pageHeaders = new Headers();
-      pageHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
+      pageHeaders.set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
       pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
-      pageHeaders.set("Accept-Language", "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7");
-      pageHeaders.set("Referer", "https://www.311s.com/");
+      pageHeaders.set("Referer", "https://www.baozimh.com/");
 
       try {
-        const pageRes = await safeFetch(s311Url, { method: "GET", headers: pageHeaders });
+        const seriesUrl = `https://www.baozimh.com/comic/${comicSlug}`;
+        const pageRes = await safeFetch(seriesUrl, { method: "GET", headers: pageHeaders });
         if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
         const html = await pageRes.text();
 
-        const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
-        const pageTitle = titleMatch ? titleMatch[1].trim() : "";
-        // Format title: "{comic} 阅读 - {chapter} - ..."
-        let comicTitle = "";
-        let chapterTitle = "";
-        const titleParts = pageTitle.split(" - ");
-        if (titleParts.length >= 2) {
-          comicTitle = titleParts[0].replace(/阅读\s*$/, "").trim();
-          chapterTitle = titleParts[1].trim();
+        const chapterLinkRe = /href="\/user\/page_direct\?comic_id=([^&]+)&amp;section_slot=(\d+)&amp;chapter_slot=(\d+)"[^>]*class="comics-chapters__item"[^>]*><div[^>]*><span[^>]*>([^<]+)<\/span>/g;
+
+        const seen = new Set();
+        const chapters = [];
+        let m;
+        while ((m = chapterLinkRe.exec(html)) !== null) {
+          const [, slug, sectionSlot, chapterSlot, title] = m;
+          const key = `${sectionSlot}_${chapterSlot}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          chapters.push({
+            section_slot: parseInt(sectionSlot, 10),
+            chapter_slot: parseInt(chapterSlot, 10),
+            chapter_title: title.trim(),
+            url: `https://www.twmanga.com/comic/chapter/${slug}/${sectionSlot}_${chapterSlot}.html`
+          });
         }
 
-        const imgTagRegex = /<img\b[^>]*>/gi;
-        const allImgTags = html.match(imgTagRegex) || [];
-        const comicImages = [];
-        let idx = 0;
-        for (const tag of allImgTags) {
-          if (!/\bclass="comic-image"/i.test(tag)) continue;
-          const srcMatch = tag.match(/\bsrc="([^"]+)"/i);
-          if (!srcMatch) continue;
-          idx++;
-          comicImages.push({ page: idx, url: srcMatch[1], alt: "" });
-        }
+        // Urut ulang eksplisit terbaru -> terlama (section_slot lalu
+        // chapter_slot, keduanya descending), jangan andalkan urutan HTML.
+        chapters.sort((a, b) => (b.section_slot - a.section_slot) || (b.chapter_slot - a.chapter_slot));
 
-        if (comicImages.length === 0) {
+        if (chapters.length === 0) {
           return new Response(
             JSON.stringify({
-              error: "No comic images found in 311s chapter page",
-              note: "Expected <img class=\"comic-image\" src=\"...\"> tags. The site may have changed its markup.",
-              debug: { comicId, chapterId, pageTitle, url: s311Url }
+              error: "No chapters found in baozimh series page",
+              note: "Expected <a href=\"/user/page_direct?...\" class=\"comics-chapters__item\"> links. The site may have changed its markup.",
+              debug: { comicSlug }
             }),
             { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
           );
         }
 
         return new Response(JSON.stringify({
-          source: "311s",
-          comic_id: parseInt(comicId),
-          chapter_id: parseInt(chapterId),
-          comic_title: comicTitle,
-          chapter_title: chapterTitle,
-          page_title: pageTitle,
-          total_images: comicImages.length,
-          images: comicImages
+          source: "baozimh",
+          type: "series",
+          comic_slug: comicSlug,
+          total_chapters: chapters.length,
+          chapters
         }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
       } catch (err) {
-        return new Response(JSON.stringify({ error: "311s failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+        return new Response(JSON.stringify({ error: "baozimh series fetch failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
       }
     }
 
@@ -486,6 +753,75 @@ export default {
       }
     }
 
+    // manwa.me: URL SERIES (bukan chapter, bukan gambar). Halaman series
+    // (manwa.me/book/{id}) render semua chapter langsung di HTML dalam
+    // <a href="/chapter/{id}" title="{judul}" class="chapteritem"> —
+    // sudah diverifikasi manual pakai sampel 230 chapter, cocok persis
+    // dengan "第230话" (chapter terbaru) yang tertulis di halaman, tanpa
+    // duplikat dan tanpa pagination.
+    //
+    // PENTING: urutan HTML aslinya TERLAMA -> TERBARU (chapter 1 di atas),
+    // kebalikan dari wmanhua/baozimh/jjaptoon yang semuanya terbaru dulu.
+    // Dibalik di sini (reverse array) supaya konsisten "terbaru di atas"
+    // sesuai kesepakatan lintas platform.
+    //
+    // Catatan: beberapa judul chapter di situs ini memakai angka Han
+    // (misal "第十五话"), dan ada juga kesalahan penomoran dari situsnya
+    // sendiri (satu chapter di posisi ke-11 berjudul "第1话" alih-alih
+    // "第11话") — keduanya dibiarkan apa adanya, tidak dinormalisasi.
+    const manwaSeriesMatch = targetUrl.href.match(/^https?:\/\/(?:www\.)?manwa\.me\/book\/(\d+)/);
+    if (manwaSeriesMatch) {
+      const bookId = manwaSeriesMatch[1];
+
+      const pageHeaders = new Headers();
+      pageHeaders.set("User-Agent", "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36");
+      pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+      pageHeaders.set("Referer", "https://manwa.me/");
+
+      try {
+        const pageRes = await safeFetch(targetUrl.toString(), { method: "GET", headers: pageHeaders });
+        if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
+        const html = await pageRes.text();
+
+        const chapterLinkRe = /<a href="\/chapter\/(\d+)" title="([^"]+)"\s*class="chapteritem\s*">/g;
+
+        const chapters = [];
+        let m;
+        while ((m = chapterLinkRe.exec(html)) !== null) {
+          const [, chapterId, title] = m;
+          chapters.push({
+            chapter_id: chapterId,
+            chapter_title: title.trim(),
+            url: `https://manwa.me/chapter/${chapterId}`
+          });
+        }
+
+        // Balik urutan: HTML asli terlama->terbaru, kita mau terbaru->terlama.
+        chapters.reverse();
+
+        if (chapters.length === 0) {
+          return new Response(
+            JSON.stringify({
+              error: "No chapters found in manwa.me series page",
+              note: "Expected <a href=\"/chapter/{id}\" title=\"...\" class=\"chapteritem\"> links. The site may have changed its markup.",
+              debug: { bookId }
+            }),
+            { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
+          );
+        }
+
+        return new Response(JSON.stringify({
+          source: "manwa",
+          type: "series",
+          book_id: bookId,
+          total_chapters: chapters.length,
+          chapters
+        }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "manwa.me series fetch failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      }
+    }
+
     // wmanhua.com: tidak ada enkripsi/signing sama sekali. Chapter HTML embed dua
     // variabel JS polos: `var num = eval("239")` (total halaman, isinya cuma angka
     // literal, eval() di sini kosmetik) dan `var pasd = "https://.../{uuid}/"` (base
@@ -571,7 +907,250 @@ export default {
       }
     }
 
-    // umum: fallback proxy generic untuk URL apa saja yang tidak dikenali di atas
+    // wmanhua.com: URL SERIES (bukan chapter). Halaman series render maksimal
+    // 24 chapter langsung di HTML, sisanya baru muncul lewat tombol "Load
+    // More" di browser yang manggil endpoint JSON internal:
+    //   POST https://www.wmanhua.com/comic/{comicId}
+    //   Content-Type: application/json
+    //   Body: {}
+    // Respons: { code: 0, data: { chapters: [{ contentId, id, chapterName }, ...] } }
+    // Endpoint ini balikin SEMUA chapter sekaligus dalam satu panggilan (sudah
+    // diverifikasi manual, bukan perlu pagination berulang), jadi kita panggil
+    // endpoint ini langsung dan skip scraping HTML sama sekali — lebih ringan
+    // dan tidak akan pernah "ketinggalan" chapter yang di luar 24 pertama.
+    const wmanhuaSeriesMatch = targetUrl.href.match(/^https?:\/\/(?:www\.)?wmanhua\.com\/comic\/(\d+)\.html/i);
+    if (wmanhuaSeriesMatch) {
+      const comicId = wmanhuaSeriesMatch[1];
+
+      const apiHeaders = new Headers();
+      apiHeaders.set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
+      apiHeaders.set("Content-Type", "application/json");
+      apiHeaders.set("Accept", "application/json, text/plain, */*");
+      apiHeaders.set("Referer", targetUrl.toString());
+
+      try {
+        const apiUrl = `https://www.wmanhua.com/comic/${comicId}`;
+        const apiRes = await safeFetch(apiUrl, { method: "POST", headers: apiHeaders, body: "{}" });
+        if (!apiRes.ok) throw new Error(`HTTP ${apiRes.status}`);
+
+        const data = await apiRes.json();
+
+        if (data.code !== 0 || !data.data || !Array.isArray(data.data.chapters)) {
+          return new Response(
+            JSON.stringify({
+              error: "No chapters found in wmanhua series API response",
+              note: "Expected { code: 0, data: { chapters: [...] } }. The site may have changed its API response shape.",
+              debug: { comicId, responseCode: data.code }
+            }),
+            { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
+          );
+        }
+
+        const chapters = data.data.chapters.map((ch) => ({
+          chapter_id: ch.id,
+          chapter_title: ch.chapterName,
+          url: `https://www.wmanhua.com/chapter/${ch.contentId}-${ch.id}.html`
+        }));
+
+        return new Response(JSON.stringify({
+          source: "wmanhua",
+          type: "series",
+          comic_id: parseInt(comicId),
+          total_chapters: chapters.length,
+          chapters
+        }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "wmanhua series fetch failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      }
+    }
+
+    // koudaimh.com: URL CHAPTER. Halaman chapter tidak menaruh URL gambar
+    // langsung di <img> — semua data (judul, daftar gambar, dst) dikemas jadi
+    // satu blob terenkripsi AES-128-CBC di variabel JS `params = '...'` pada
+    // HTML halaman. Key statis (sudah diverifikasi manual lewat simulasi
+    // Python terhadap chapter asli): "5V&RoR%Jf@pJPydF" (16 byte -> AES-128).
+    // IV BUKAN key seperti manwa.me — di sini IV adalah 16 byte PERTAMA dari
+    // hasil base64-decode blob, dan sisanya (byte ke-17 dst) adalah ciphertext
+    // sesungguhnya. Setelah didekripsi, hasilnya JSON dengan field
+    // `chapter_title`, `comic_name`, `chapter_images` (array URL gambar,
+    // di-host di CDN terpisah *.shimolife.com, bukan di koudaimh.com sendiri
+    // — makanya shimolife.com juga perlu ada di ALLOWED_HOST_SUFFIXES).
+    // crypto.subtle AES-CBC otomatis meng-unpad PKCS7 sendiri saat decrypt,
+    // jadi tidak perlu unpad manual seperti port CryptoJS aslinya.
+    const koudaimhChapterMatch = targetUrl.href.match(/^https?:\/\/(?:www\.|m\.)?koudaimh\.com\/manhua\/([^/]+)\/(\d+)\.html/);
+    if (koudaimhChapterMatch) {
+      const seriesSlug = koudaimhChapterMatch[1];
+      const chapterId = koudaimhChapterMatch[2];
+
+      const pageHeaders = new Headers();
+      pageHeaders.set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
+      pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+      pageHeaders.set("Referer", "https://m.koudaimh.com/");
+
+      try {
+        const pageRes = await safeFetch(targetUrl.toString(), { method: "GET", headers: pageHeaders });
+        if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
+        const html = await pageRes.text();
+
+        const paramsMatch = html.match(/params\s*=\s*['"]([^'"]+)/);
+        if (!paramsMatch) {
+          return new Response(
+            JSON.stringify({
+              error: "No params blob found in koudaimh chapter page",
+              note: "Expected a `params = '...'` JS variable containing base64-encoded encrypted data. The site may have changed its markup.",
+              debug: { seriesSlug, chapterId }
+            }),
+            { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
+          );
+        }
+
+        const KOUDAIMH_AES_KEY = "5V&RoR%Jf@pJPydF";
+
+        let data;
+        try {
+          const rawBytes = Uint8Array.from(atob(paramsMatch[1]), (c) => c.charCodeAt(0));
+          const iv = rawBytes.slice(0, 16);
+          const ciphertext = rawBytes.slice(16);
+
+          const keyBytes = new TextEncoder().encode(KOUDAIMH_AES_KEY);
+          const cryptoKey = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-CBC" }, false, ["decrypt"]);
+          const decryptedBuffer = await crypto.subtle.decrypt({ name: "AES-CBC", iv }, cryptoKey, ciphertext);
+
+          const plaintext = new TextDecoder("utf-8").decode(decryptedBuffer);
+          data = JSON.parse(plaintext);
+        } catch (decryptErr) {
+          return new Response(
+            JSON.stringify({ error: "koudaimh params decrypt failed", detail: decryptErr.message }),
+            { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
+          );
+        }
+
+        const rawImages = Array.isArray(data.chapter_images) ? data.chapter_images : [];
+        const comicImages = rawImages.map((url, i) => ({ page: i + 1, url }));
+
+        if (comicImages.length === 0) {
+          return new Response(
+            JSON.stringify({
+              error: "No comic images found in koudaimh chapter data",
+              note: "Decrypted successfully but chapter_images was empty/missing. The site may have changed its JSON shape.",
+              debug: { seriesSlug, chapterId, decryptedKeys: Object.keys(data) }
+            }),
+            { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
+          );
+        }
+
+        return new Response(JSON.stringify({
+          source: "koudaimh",
+          comic_id: data.comic_id ?? null,
+          chapter_id: data.chapter_id ?? parseInt(chapterId),
+          comic_title: data.comic_name || "",
+          chapter_title: data.chapter_title || "",
+          total_images: comicImages.length,
+          images: comicImages
+        }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "koudaimh chapter failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      }
+    }
+
+    // koudaimh.com: URL SERIES (bukan chapter). Semua chapter (bisa ratusan)
+    // sudah dirender langsung di HTML halaman series dalam satu blok
+    // "章节目录" (daftar chapter), TIDAK ada pagination/lazy-load/API
+    // tersembunyi (sudah diverifikasi manual: chapter 1 s.d. terbaru semuanya
+    // ada di HTML sekali fetch). Urutan aslinya di HTML adalah lama -> baru;
+    // dibalik di sini supaya konsisten dengan konvensi worker ini (chapter
+    // terbaru ditampilkan duluan di modal pemilih chapter, lihat wmanhua).
+    const koudaimhSeriesMatch = targetUrl.href.match(/^https?:\/\/(?:www\.|m\.)?koudaimh\.com\/manhua\/([^/]+)\/?(?:[?#].*)?$/);
+    if (koudaimhSeriesMatch) {
+      const seriesSlug = koudaimhSeriesMatch[1];
+
+      const pageHeaders = new Headers();
+      pageHeaders.set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
+      pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+      pageHeaders.set("Referer", "https://m.koudaimh.com/");
+
+      try {
+        const pageRes = await safeFetch(targetUrl.toString(), { method: "GET", headers: pageHeaders });
+        if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
+        const html = await pageRes.text();
+
+        const titleMatch = html.match(/<h1[^>]*>\s*([\s\S]*?)\s*<\/h1>/i);
+        const comicTitle = titleMatch ? titleMatch[1].replace(/\s+/g, " ").trim() : "";
+
+        const coverMatch = html.match(/<img[^>]+src="([^"]+)"[^>]*alt="[^"]*"/i);
+        const cover = coverMatch ? coverMatch[1] : "";
+
+        const authorMatch = html.match(/作者[:：]\s*<\/?[^>]*>?\s*([^<\n]+)/i) || html.match(/作者[:：]\s*([^<\n]+)/i);
+        const author = authorMatch ? authorMatch[1].trim() : "";
+
+        const statusMatch = html.match(/状态[:：]\s*<\/?[^>]*>?\s*([^<\n]+)/i) || html.match(/状态[:：]\s*([^<\n]+)/i);
+        const status = statusMatch ? statusMatch[1].trim() : "";
+
+        const descMatch = html.match(/简介[:：]\s*<\/?[^>]*>?\s*([^<\n]+)/i) || html.match(/简介[:：]\s*([^<\n]+)/i);
+        const description = descMatch ? descMatch[1].trim() : "";
+
+        // Daftar chapter: link berpola /manhua/{slug}/{id}.html dengan teks
+        // judulnya. Dua blok tampil di halaman ("最新章节" ringkas + "章节目录"
+        // lengkap) — hasilnya sama-sama valid tapi bisa duplikat, jadi
+        // dedupe berdasarkan chapter_id di akhir.
+        const linkRegex = new RegExp(
+          `<a[^>]+href="(?:https?://(?:www\\.|m\\.)?koudaimh\\.com)?/manhua/${seriesSlug}/(\\d+)\\.html"[^>]*>\\s*([\\s\\S]*?)\\s*<\\/a>`,
+          "gi"
+        );
+
+        const seen = new Set();
+        const chapters = [];
+        let m;
+        while ((m = linkRegex.exec(html)) !== null) {
+          const chId = m[1];
+          if (seen.has(chId)) continue;
+          seen.add(chId);
+          const chTitle = m[2].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+          chapters.push({
+            chapter_id: parseInt(chId),
+            chapter_title: chTitle,
+            url: `https://m.koudaimh.com/manhua/${seriesSlug}/${chId}.html`
+          });
+        }
+
+        if (chapters.length === 0) {
+          return new Response(
+            JSON.stringify({
+              error: "No chapters found in koudaimh series page",
+              note: "Expected <a href=\"/manhua/{slug}/{id}.html\">...</a> links. The site may have changed its markup.",
+              debug: { seriesSlug }
+            }),
+            { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
+          );
+        }
+
+        // Urutan asli di HTML lama -> baru; dibalik supaya terbaru -> terlama.
+        chapters.sort((a, b) => b.chapter_id - a.chapter_id);
+
+        return new Response(JSON.stringify({
+          source: "koudaimh",
+          type: "series",
+          comic_title: comicTitle,
+          cover,
+          author,
+          status,
+          description,
+          total_chapters: chapters.length,
+          chapters
+        }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "koudaimh series fetch failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      }
+    }
+
+    // umum: fallback proxy generic — dimaksudkan HANYA untuk mengambil file
+    // media (gambar/video) dari CDN yang sudah di-allowlist, bukan endpoint
+    // HTML/JSON sembarangan di domain yang sama (lihat bug #2l — sebelumnya
+    // pembatasan cuma berdasarkan hostname, jadi seluruh path di host itu
+    // ikut bisa diproksi). Content-Type dari response dicek setelah fetch:
+    // kalau bukan media, ditolak — ini lebih reliable daripada menebak dari
+    // pola URL, karena banyak CDN manga tidak selalu punya ekstensi jelas
+    // di path-nya.
     let effectiveReferer = targetUrl.origin + "/";
     let effectiveOrigin = targetUrl.origin;
     if (referer) { try { const r = new URL(referer); effectiveReferer = referer; effectiveOrigin = r.origin; } catch {} }
@@ -584,6 +1163,17 @@ export default {
 
     try {
       const response = await safeFetch(targetUrl.toString(), { method: "GET", headers });
+
+      const contentType = (response.headers.get("content-type") || "").toLowerCase();
+      const isMedia = contentType.startsWith("image/") || contentType.startsWith("video/") || contentType.startsWith("audio/");
+      if (!isMedia) {
+        if (response.body) { try { await response.body.cancel(); } catch {} }
+        return new Response(
+          JSON.stringify({ error: "Generic proxy only serves media (image/video/audio)", contentType: contentType || null }),
+          { status: 415, headers: { ...corsHeaders(request), "Content-Type": "application/json" } }
+        );
+      }
+
       const responseHeaders = new Headers(response.headers);
       const cors = corsHeaders(request);
       responseHeaders.set("Access-Control-Allow-Origin", cors["Access-Control-Allow-Origin"]);
@@ -602,11 +1192,12 @@ export default {
 // umum: jika frontend sudah punya domain tetap, isi di sini untuk membatasi CORS
 // (lihat bug #22). Biarkan null untuk tetap mengizinkan semua origin ("*").
 //
-// Diisi ke domain Netlify saat ini. Kalau nanti pindah project Netlify (nama
-// project berubah) atau pindah ke domain custom, update nilai ini juga —
-// kalau lupa, gejalanya frontend sendiri ikut kena blokir CORS (bukan cuma
-// web orang lain).
-const ALLOWED_ORIGIN = "https://trialfetch.netlify.app";
+// DIMATIKAN SEMENTARA (null) — worker ini dipakai buat percobaan fitur URL
+// series di akun Cloudflare terpisah dari yang production, jadi belum ada
+// satu domain frontend tetap yang pasti dipakai buat tes. Nyalakan lagi
+// (isi domain frontend-nya) begitu fitur ini sudah matang dan mau dipindah
+// ke worker production.
+const ALLOWED_ORIGIN = null; 
 
 function corsHeaders(request) {
   let allowOrigin = "*";

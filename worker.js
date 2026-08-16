@@ -213,12 +213,15 @@ async function safeFetch(url, options = {}, maxRedirects = 5) {
       }
       // 307/308: method dan body sengaja TIDAK diubah sama sekali.
 
-      // Origin berubah -> lepas header origin-spesifik, bangun ulang
-      // Referer/Origin sesuai origin baru (lihat bug #2d).
+      // Origin berubah -> lepas header origin-spesifik (lihat bug #2d).
+      // TIDAK membangun ulang Referer/Origin otomatis di sini — kalau
+      // request awal sengaja tidak menyertakan header itu (misal untuk CDN
+      // ber-signed-URL seperti shimolife.com yang memakai
+      // referrerpolicy="no-referrer" di halaman aslinya), menambahkannya
+      // kembali saat redirect akan membuat request berbeda dari yang
+      // diharapkan upstream dan berisiko ditolak.
       if (nextUrl.origin !== originalOrigin) {
         for (const h of ORIGIN_SPECIFIC_HEADERS) currentHeaders.delete(h);
-        currentHeaders.set("Referer", nextUrl.origin + "/");
-        currentHeaders.set("Origin", nextUrl.origin);
       }
 
       currentUrl = nextUrl.toString();
@@ -260,14 +263,19 @@ export default {
       return new Response("Missing ?url=", { status: 400, headers: corsHeaders(request) });
     }
 
+    // Frontend selalu encode URL persis sekali lewat encodeURIComponent()
+    // sebelum dikirim ke sini, jadi 1x decodeURIComponent() sudah cukup
+    // untuk membalikkannya. Loop decode berulang (sebelumnya sampai 3x)
+    // berisiko merusak signed URL: kalau sebuah signature base64 kebetulan
+    // mengandung pola yang terlihat seperti percent-encoding (mis. "%3D"
+    // muncul lagi di dalam hasil decode pertama), decode kedua bisa
+    // mengubah karakter yang seharusnya tetap apa adanya, membuat
+    // x-signature tidak lagi cocok dan CDN menolak dengan 403 (kasus yang
+    // pernah terjadi pada gambar Koudaimh/shimolife.com).
     let decodedTarget = target;
-    for (let i = 0; i < 3; i++) {
-      try {
-        const newDecoded = decodeURIComponent(decodedTarget);
-        if (newDecoded === decodedTarget) break;
-        decodedTarget = newDecoded;
-      } catch { break; }
-    }
+    try {
+      decodedTarget = decodeURIComponent(target);
+    } catch { /* biarkan target apa adanya kalau decode gagal */ }
 
     let targetUrl;
     try {
@@ -1151,25 +1159,62 @@ export default {
     // kalau bukan media, ditolak — ini lebih reliable daripada menebak dari
     // pola URL, karena banyak CDN manga tidak selalu punya ekstensi jelas
     // di path-nya.
-    let effectiveReferer = targetUrl.origin + "/";
-    let effectiveOrigin = targetUrl.origin;
-    if (referer) { try { const r = new URL(referer); effectiveReferer = referer; effectiveOrigin = r.origin; } catch {} }
+    const isShimolife = targetUrl.hostname === "shimolife.com" || targetUrl.hostname.endsWith(".shimolife.com");
 
     const headers = new Headers();
-    headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
-    headers.set("Accept", "text/html,*/*;q=0.8");
-    headers.set("Referer", effectiveReferer);
-    headers.set("Origin", effectiveOrigin);
+    // Koudaimh memuat gambar chapter-nya dengan referrerpolicy="no-referrer"
+    // di HTML aslinya — artinya browser asli memang TIDAK mengirim header
+    // Referer/Origin sama sekali saat memuat gambar dari *.shimolife.com.
+    // Meniru itu di sini (skip kedua header untuk host ini) supaya request
+    // proxy terlihat sama seperti request asli yang diizinkan CDN; mengirim
+    // Referer/Origin yang sebenarnya tidak pernah ada pada request asli bisa
+    // membuat CDN menganggapnya request mencurigakan dan menolak dengan 403.
+    if (isShimolife) {
+      headers.set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
+      headers.set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8");
+      headers.set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8");
+    } else {
+      let effectiveReferer = targetUrl.origin + "/";
+      let effectiveOrigin = targetUrl.origin;
+      if (referer) { try { const r = new URL(referer); effectiveReferer = referer; effectiveOrigin = r.origin; } catch {} }
+
+      headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+      headers.set("Accept", "text/html,*/*;q=0.8");
+      headers.set("Referer", effectiveReferer);
+      headers.set("Origin", effectiveOrigin);
+    }
 
     try {
       const response = await safeFetch(targetUrl.toString(), { method: "GET", headers });
+
+      // Cek status upstream DULU sebelum menilai content-type. Sebelumnya,
+      // sebuah 403 dari CDN (yang biasanya membalas halaman HTML kecil
+      // berisi pesan error, bukan gambar) langsung jatuh ke pengecekan
+      // isMedia di bawah dan dilaporkan sebagai 415 "Generic proxy only
+      // serves media" — pesan itu menyesatkan karena masalah sebenarnya
+      // adalah upstream menolak requestnya (403/429/dst), bukan proxy ini
+      // yang pilih-pilih tipe konten. Membedakan ini penting untuk
+      // diagnosis: 403 upstream nunjuk ke soal header/signed-URL, sedangkan
+      // 415 asli nunjuk ke soal proxy dipakai untuk endpoint non-media.
+      if (!response.ok) {
+        if (response.body) { try { await response.body.cancel(); } catch {} }
+        return new Response(
+          JSON.stringify({
+            error: "Upstream media request failed",
+            upstreamStatus: response.status,
+            upstreamStatusText: response.statusText,
+            hostname: targetUrl.hostname
+          }),
+          { status: response.status, headers: { ...corsHeaders(request), "Content-Type": "application/json", "X-Upstream-Status": String(response.status) } }
+        );
+      }
 
       const contentType = (response.headers.get("content-type") || "").toLowerCase();
       const isMedia = contentType.startsWith("image/") || contentType.startsWith("video/") || contentType.startsWith("audio/");
       if (!isMedia) {
         if (response.body) { try { await response.body.cancel(); } catch {} }
         return new Response(
-          JSON.stringify({ error: "Generic proxy only serves media (image/video/audio)", contentType: contentType || null }),
+          JSON.stringify({ error: "Generic proxy only serves media (image/video/audio)", contentType: contentType || null, hostname: targetUrl.hostname }),
           { status: 415, headers: { ...corsHeaders(request), "Content-Type": "application/json" } }
         );
       }
@@ -1197,7 +1242,7 @@ export default {
 // satu domain frontend tetap yang pasti dipakai buat tes. Nyalakan lagi
 // (isi domain frontend-nya) begitu fitur ini sudah matang dan mau dipindah
 // ke worker production.
-const ALLOWED_ORIGIN = null; 
+const ALLOWED_ORIGIN = "https://trialfetch.netlify.app"; 
 
 function corsHeaders(request) {
   let allowOrigin = "*";

@@ -972,6 +972,82 @@ export default {
       }
     }
 
+    // koudaimh.com: ENDPOINT DIAGNOSTIK SEMENTARA (bukan bagian dari alur
+    // produksi) — dipakai untuk menguji teori kenapa gambar Koudaimh selalu
+    // 403 walau signed URL-nya baru saja di-generate: apakah karena
+    // x-signature terikat ke IP requester, dan Worker Cloudflare tidak
+    // menjamin request kedua (fetch gambar) keluar dari IP edge yang SAMA
+    // dengan request pertama (fetch halaman chapter yang menghasilkan
+    // signature itu)? Endpoint ini fetch halaman DAN gambar pertamanya di
+    // DALAM SATU eksekusi Worker yang sama (bukan dua request terpisah dari
+    // frontend), untuk melihat apakah itu membuat perbedaan. Dipicu lewat
+    // parameter ?koudaimh_test=1 supaya tidak menyentuh alur normal sama
+    // sekali. Aman dihapus setelah investigasi selesai.
+    if (reqUrl.searchParams.get("koudaimh_test") === "1") {
+      const chapterMatch = targetUrl.href.match(/^https?:\/\/(?:www\.|m\.)?koudaimh\.com\/manhua\/([^/]+)\/(\d+)\.html/);
+      if (!chapterMatch) {
+        return new Response(JSON.stringify({ error: "koudaimh_test: url bukan chapter koudaimh yang valid" }), { status: 400, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      }
+      try {
+        const pageHeaders = new Headers();
+        pageHeaders.set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
+        pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+        pageHeaders.set("Referer", "https://m.koudaimh.com/");
+
+        const t0 = Date.now();
+        const pageRes = await safeFetch(targetUrl.toString(), { method: "GET", headers: pageHeaders });
+        const pageMs = Date.now() - t0;
+        if (!pageRes.ok) throw new Error(`Fetch halaman chapter gagal: HTTP ${pageRes.status}`);
+        const html = await pageRes.text();
+
+        const paramsMatch = html.match(/params\s*=\s*['"]([^'"]+)/);
+        if (!paramsMatch) throw new Error("params tidak ditemukan di halaman");
+
+        const KOUDAIMH_AES_KEY = "5V&RoR%Jf@pJPydF";
+        const rawBytes = Uint8Array.from(atob(paramsMatch[1]), (c) => c.charCodeAt(0));
+        const iv = rawBytes.slice(0, 16);
+        const ciphertext = rawBytes.slice(16);
+        const keyBytes = new TextEncoder().encode(KOUDAIMH_AES_KEY);
+        const cryptoKey = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-CBC" }, false, ["decrypt"]);
+        const decryptedBuffer = await crypto.subtle.decrypt({ name: "AES-CBC", iv }, cryptoKey, ciphertext);
+        const decryptedData = JSON.parse(new TextDecoder("utf-8").decode(decryptedBuffer));
+
+        const firstImageUrl = Array.isArray(decryptedData.chapter_images) ? decryptedData.chapter_images[0] : null;
+        if (!firstImageUrl) throw new Error("chapter_images kosong setelah decrypt");
+
+        // LANGSUNG fetch gambar pertama di sini, TANPA balik ke frontend
+        // dulu — inilah inti pengujiannya: apakah IP edge Worker yang
+        // dipakai di titik ini (segera setelah fetch halaman, di eksekusi
+        // yang sama) sama dengan yang "dikenali" signature ini.
+        const t1 = Date.now();
+        const imgRes = await safeFetch(firstImageUrl, { method: "GET", headers: new Headers() }); // TANPA Referer/Origin sama sekali, persis seperti browser asli (no-referrer)
+        const imgMs = Date.now() - t1;
+
+        let imgBodyPreview = null;
+        if (!imgRes.ok) {
+          try { imgBodyPreview = (await imgRes.text()).slice(0, 300); } catch {}
+        }
+
+        return new Response(JSON.stringify({
+          test: "koudaimh_same_invocation",
+          pageStatus: pageRes.status,
+          pageFetchMs: pageMs,
+          firstImageUrl,
+          imageStatus: imgRes.status,
+          imageStatusText: imgRes.statusText,
+          imageFetchMs: imgMs,
+          imageOk: imgRes.ok,
+          imageContentType: imgRes.headers.get("content-type"),
+          imageBodyPreviewIfFailed: imgBodyPreview,
+          conclusion: imgRes.ok
+            ? "BERHASIL dalam satu invocation -> mendukung teori IP-per-invocation, kemungkinan bisa diperbaiki dengan restrukturisasi worker"
+            : "TETAP GAGAL walau same-invocation -> teori IP-bound per-invocation SALAH, kemungkinan besar per-request individual atau penyebab lain sama sekali"
+        }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      } catch (err) {
+        return new Response(JSON.stringify({ test: "koudaimh_same_invocation", error: err.message }), { status: 500, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      }
+    }
+
     // koudaimh.com: URL CHAPTER. Halaman chapter tidak menaruh URL gambar
     // langsung di <img> — semua data (judul, daftar gambar, dst) dikemas jadi
     // satu blob terenkripsi AES-128-CBC di variabel JS `params = '...'` pada

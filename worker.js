@@ -1242,7 +1242,7 @@ export default {
 // satu domain frontend tetap yang pasti dipakai buat tes. Nyalakan lagi
 // (isi domain frontend-nya) begitu fitur ini sudah matang dan mau dipindah
 // ke worker production.
-const ALLOWED_ORIGIN = "https://trialfetch.netlify.app"; 
+const ALLOWED_ORIGIN = null;  // dibuat null karena sedang masa percobaan
 
 function corsHeaders(request) {
   let allowOrigin = "*";

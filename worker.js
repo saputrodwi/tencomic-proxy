@@ -13,11 +13,25 @@
 // Kalau situsnya pindah ke TLD baru lagi di luar daftar ini, tambahkan di sini.
 const JJAPTOON_HOST_RE = /^(www\.)?jjaptoon\d*\.(com|net|vip|xyz|top|me)$/;
 
+// Baozi/TWManga merotasi domain app-nya lewat DUA sumbu berbeda sekaligus:
+// (1) nama domain inti (sudah pernah: baozimh.com; sekarang juga bisa:
+// bzmgapp.com) dan (2) nomor subdomain appgb (appgb, appgb1, appgb3, dst).
+// Dikonfirmasi lewat network capture app Android resmi, 24 Agustus 2026 —
+// contoh nyata: appgb3.baozimh.com DAN appgb1.bzmgapp.com sama-sama
+// dipakai. Jangan asumsikan cuma satu domain inti yang berlaku; regex ini
+// menerima kombinasi apapun dari kedua domain yang sudah terverifikasi.
+// Kalau nanti muncul domain inti ketiga, tambahkan ke grup di bawah.
+const APPGB_HOST_RE = /^appgb\d*\.(baozimh\.com|bzmgapp\.com)$/;
+
 const ALLOWED_HOST_SUFFIXES = [
   "twmanga.com",
   "baozimh.com",
   "baozicdn.com",
   "bzcdn.net",
+  // Domain inti kedua untuk app Baozi (lihat catatan APPGB_HOST_RE di
+  // atas) — appgb1.bzmgapp.com sudah terverifikasi dipakai selain
+  // appgb3.baozimh.com.
+  "bzmgapp.com",
   "manwa.me",
   "mwappimgs.cc",
   "wmanhua.com",
@@ -31,6 +45,7 @@ const ALLOWED_HOST_SUFFIXES = [
 function isHostAllowed(hostname) {
   const h = hostname.toLowerCase();
   if (JJAPTOON_HOST_RE.test(h)) return true;
+  if (APPGB_HOST_RE.test(h)) return true;
   return ALLOWED_HOST_SUFFIXES.some((suffix) => h === suffix || h.endsWith("." + suffix));
 }
 
@@ -494,13 +509,34 @@ export default {
       }
     }
 
-    // baozimh/twmanga: chapter diakses lewat www.twmanga.com, tapi datanya diambil dari app.baozimh.com pakai header app khusus
+    // baozimh/twmanga: chapter diakses lewat www.twmanga.com, tapi datanya diambil dari appgb3.baozimh.com pakai header app khusus
     const baoziMatch = targetUrl.href.match(/(?:twmanga\.com|baozimh\.com)\/(?:comic\/chapter|baozimhapp\/comic\/chapter)\/([^/]+)\/([^/?#]+)\.html/);
     if (baoziMatch) {
       const comicSlug = baoziMatch[1];
       const chapterFile = baoziMatch[2];
 
-      const apiUrl = `https://app.baozimh.com/baozimhapp/comic/chapter/${comicSlug}/${chapterFile}.html`;
+      // Baozi merotasi host app-nya secara RANDOM per-chapter, bukan sekadar
+      // 1-2 host tetap — dikonfirmasi lewat observasi lintas kategori
+      // (manhua mainland, manga, manhwa, komik barat) per 24 Agustus 2026.
+      // Kombinasi yang aktif: nomor subdomain 1-3 × dua domain inti
+      // (bzmgapp.com, baozimh.com) = 6 kandidat. appgb1.bzmgapp.com paling
+      // sering "menang" secara keseluruhan, jadi ditaruh di urutan pertama
+      // supaya rata-rata butuh lebih sedikit percobaan sebelum berhasil.
+      // Dicoba berurutan (fallback chain), bukan paralel, supaya tidak
+      // boros request kalau kandidat pertama sudah berhasil.
+      // PENTING: Referer di bawah SENGAJA TIDAK ikut mengikuti kandidat
+      // mana yang dipakai — app resmi tetap kirim Referer ke host generik
+      // "appgb.baozimh.com" (tanpa angka) apa pun kombinasi yang berhasil,
+      // jadi jangan disamakan otomatis.
+      // Kalau nanti nomor subdomain lain (mis. appgb4) mulai kelihatan di
+      // network capture, cukup tambahkan ke BAOZI_APP_SUBDOMAIN_NUMBERS —
+      // APPGB_HOST_RE di atas sudah general (appgb\d*) jadi allowlist tidak
+      // perlu ikut diubah.
+      const BAOZI_APP_SUBDOMAIN_NUMBERS = [1, 2, 3];
+      const BAOZI_APP_CORE_DOMAINS = ["bzmgapp.com", "baozimh.com"];
+      const BAOZI_APP_HOST_CANDIDATES = BAOZI_APP_CORE_DOMAINS.flatMap((domain) =>
+        BAOZI_APP_SUBDOMAIN_NUMBERS.map((n) => `appgb${n}.${domain}`)
+      );
 
       // Kredensial app baozimh WAJIB diisi lewat Cloudflare environment
       // variable (Settings > Variables and Secrets di dashboard Worker) —
@@ -530,9 +566,32 @@ export default {
       baoziHeaders.set("Accept-Encoding", "gzip");
       baoziHeaders.set("Connection", "Keep-Alive");
 
+      // apiUrl dibangun per-kandidat di dalam loop fallback di bawah, bukan
+      // nilai tunggal — lihat catatan BAOZI_APP_HOST_CANDIDATES di atas.
+      let apiRes = null;
+      let lastFetchErr = null;
+      for (const candidateHost of BAOZI_APP_HOST_CANDIDATES) {
+        const candidateUrl = `https://${candidateHost}/baozimhapp/comic/chapter/${comicSlug}/${chapterFile}.html`;
+        try {
+          const res = await safeFetch(candidateUrl, { method: "GET", headers: baoziHeaders });
+          if (res.ok) { apiRes = res; break; }
+          lastFetchErr = new Error(`HTTP ${res.status} dari ${candidateHost}`);
+        } catch (e) {
+          lastFetchErr = e;
+        }
+      }
+      if (!apiRes) {
+        return new Response(
+          JSON.stringify({
+            error: "Semua kandidat host app Baozi gagal",
+            detail: lastFetchErr ? lastFetchErr.message : "unknown",
+            candidatesTried: BAOZI_APP_HOST_CANDIDATES
+          }),
+          { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" } }
+        );
+      }
+
       try {
-        const apiRes = await safeFetch(apiUrl, { method: "GET", headers: baoziHeaders });
-        if (!apiRes.ok) throw new Error(`HTTP ${apiRes.status}`);
         const html = await apiRes.text();
 
         const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
@@ -562,7 +621,7 @@ export default {
             JSON.stringify({
               error: "No comic images found in baozimh chapter page",
               note: "Expected <img class=\"comic-contain__item\" data-src=\"...\"> tags. The site may have changed its markup.",
-              debug: { comicSlug, chapterFile, pageTitle, apiUrl }
+              debug: { comicSlug, chapterFile, pageTitle, hostUsed: apiRes.url }
             }),
             { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
           );

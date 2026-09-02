@@ -11,23 +11,24 @@
 // selalu ketinggalan kombinasi terbaru, jadi dicocokkan lewat pola yang
 // menerima nomor opsional + salah satu TLD dari daftar yang pernah teramati.
 // Kalau situsnya pindah ke TLD baru lagi di luar daftar ini, tambahkan di sini.
+const JJAPTOON_HOST_RE = /^(www\.)?jjaptoon\d*\.(com|net|vip|xyz|top|me)$/;
+
+// KOREKSI 2 September 2026: sempat salah diasumsikan "jjaptoon berganti
+// nama total jadi jjabtoon" — TERNYATA SALAH. jjaptoon sempat error/down
+// sementara (bukan mati permanen), dan jjabtoon adalah situs LAIN yang
+// ditemukan terpisah saat mencari alternatif. Keduanya hidup berdampingan
+// dan dikonfirmasi user sebagai dua source berbeda. jjaptoon tetap pakai
+// struktur HTML-scrape lama (regex di atas, tidak berubah). jjabtoon
+// diberi regex + entri source SENDIRI di bawah ini — jangan digabung lagi.
 //
-// 2 September 2026: situs ganti nama domain intinya sepenuhnya dari
-// "jjaptoon" ke "jjabtoon" (huruf p -> b, bukan cuma nomor/TLD seperti
-// biasanya) — jjaptoon lama mati/redirect total, dikonfirmasi tidak ada
-// kasus keduanya hidup berdampingan. TLD yang dipakai tetap sama seperti
-// sebelumnya. Pola nama diperluas jadi jja[pb]toon supaya menerima kedua
-// ejaan sekaligus — kalau nanti muncul ejaan lain lagi, tambahkan ke
-// grup karakter [pb] ini.
-//
-// Situs baru (jjabtoon) juga ARSITEKTURNYA beda total, bukan cuma nama:
-// ada REST JSON API (/api/webtoons/{id}, /api/episodes/{id}), dan CDN
-// gambarnya di subdomain "cdn." yang terpisah dari domain utama (contoh
-// nyata: cdn.jjabtoon001.com, beda host dari jjabtoon001.com halaman
-// utamanya) — grup prefix regex diperluas dari cuma "www." jadi "www.|cdn."
-// supaya subdomain cdn. ikut lolos allowlist, karena gambar chapter
-// di-fetch langsung dari sana lewat proxy generic di bagian bawah file ini.
-const JJAPTOON_HOST_RE = /^(www\.|cdn\.)?jja[pb]toon\d*\.(com|net|vip|xyz|top|me)$/;
+// jjabtoon arsitekturnya beda total dari jjaptoon: situs punya REST JSON
+// API (/api/webtoons/{id}, /api/episodes/{id}), dan CDN gambarnya di
+// subdomain "cdn." terpisah dari domain utama (contoh nyata dari network
+// capture user: cdn.jjabtoon001.com, beda host dari jjabtoon001.com
+// halaman utamanya) — prefix cdn. wajib ada di regex ini karena gambar
+// chapter di-fetch langsung dari sana lewat proxy generic di bagian bawah
+// file ini.
+const JJABTOON_HOST_RE = /^(www\.|cdn\.)?jjabtoon\d*\.(com|net|vip|xyz|top|me)$/;
 
 // Baozi/TWManga merotasi domain app-nya lewat DUA sumbu berbeda sekaligus:
 // (1) nama domain inti (sudah pernah: baozimh.com; sekarang juga bisa:
@@ -61,6 +62,7 @@ const ALLOWED_HOST_SUFFIXES = [
 function isHostAllowed(hostname) {
   const h = hostname.toLowerCase();
   if (JJAPTOON_HOST_RE.test(h)) return true;
+  if (JJABTOON_HOST_RE.test(h)) return true;
   if (APPGB_HOST_RE.test(h)) return true;
   return ALLOWED_HOST_SUFFIXES.some((suffix) => h === suffix || h.endsWith("." + suffix));
 }
@@ -328,21 +330,155 @@ export default {
       );
     }
 
-    // jjaptoon/jjabtoon: situs BARU (sejak 2 Sep 2026, ganti nama dari
-    // jjaptoon ke jjabtoon) punya REST JSON API bersih di /api/episodes/{id}
-    // — TIDAK perlu lagi scrape HTML <img alt> seperti pendekatan lama.
-    // Path URL chapter juga berubah dari /chapters/{id} ke /episodes/{id}.
-    // Nama variabel/source tetap "jjaptoon" secara internal (dipakai sebagai
-    // key di beberapa tempat lain, functionally tidak masalah).
-    const jjaptoonMatch = targetUrl.href.match(/^https?:\/\/[^/]*jja[pb]toon[^/]*\/episodes\/(\d+)/);
+    // jjaptoon: situs LAMA, tetap hidup (sempat error/down sementara 2 Sep
+    // 2026, TAPI itu bukan migrasi permanen — dikonfirmasi user situs ini
+    // masih dipakai dan strukturnya TIDAK berubah). Gambar sudah ada
+    // langsung di <img src> HTML, jadi kita scrape URL-nya langsung —
+    // JANGAN diganti ke JSON API seperti jjabtoon, situs ini beda dan
+    // masih HTML-scrape based.
+    const jjaptoonMatch = targetUrl.href.match(/^https?:\/\/[^/]*jjaptoon[^/]*\/chapters\/(\d+)/);
     if (jjaptoonMatch) {
-      const episodeId = jjaptoonMatch[1];
+      const chapterId = jjaptoonMatch[1];
+
+      // Domain jjaptoon berubah dari waktu ke waktu (003, 004, dst, dan bisa
+      // juga TLD beda). Coba URL asli dulu, baru fallback ke domain umum
+      // tanpa nomor kalau gagal.
+      const urlsToTry = [
+        targetUrl.toString(),
+        `https://www.jjaptoon.com/chapters/${chapterId}`,
+        `https://jjaptoon.com/chapters/${chapterId}`
+      ];
+
+      let lastError = null;
+      let html = null;
+      let successUrl = null;
+
+      // Timeout per domain: kalau satu domain jjaptoon sedang mati/lambat,
+      // jangan menunggu sampai batas timeout Cloudflare (bisa puluhan detik).
+      // Beri 8 detik per percobaan, lalu segera pindah ke domain fallback berikutnya.
+      const FETCH_TIMEOUT_MS = 8000;
+
+      for (const url of urlsToTry) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+        try {
+          const pageHeaders = new Headers();
+          pageHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
+          pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+          pageHeaders.set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7");
+          pageHeaders.set("Referer", new URL(url).origin + "/");
+
+          const pageRes = await safeFetch(url, { method: "GET", headers: pageHeaders, signal: controller.signal });
+
+          if (pageRes.ok) {
+            html = await pageRes.text();
+            successUrl = url;
+            break;
+          } else {
+            lastError = `HTTP ${pageRes.status} for ${url}`;
+          }
+        } catch (e) {
+          lastError = e.name === "AbortError" ? `Timeout (${FETCH_TIMEOUT_MS}ms) for ${url}` : e.message;
+        } finally {
+          clearTimeout(timeoutId);
+        }
+      }
+
+      if (!html) {
+        return new Response(
+          JSON.stringify({
+            error: "Jjaptoon chapter not found",
+            detail: lastError || "All URLs failed",
+            tried: urlsToTry
+          }),
+          { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
+        );
+      }
+
+      const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+      const pageTitle = titleMatch ? titleMatch[1].trim() : "";
+
+      let comicTitle = "";
+      let chapterTitle = "";
+
+      if (pageTitle.includes(" - ")) {
+        const parts = pageTitle.split(" - ");
+        comicTitle = parts[0].trim();
+        chapterTitle = parts[1].trim();
+      }
+
+      // Gambar di-render langsung di HTML. JANGAN whitelist path CDN
+      // tertentu (comics-imported, attachment/scraping, dst) — situs ini
+      // sering ganti domain/path CDN gambar tanpa pemberitahuan. Kalau path
+      // baru muncul, whitelist lama akan salah membuang semua gambar
+      // chapter. Sebaliknya: setiap <img> di halaman ini punya alt text
+      // berpola "{judul komik} {judul chapter} {nomor halaman}". Itu ciri
+      // konten chapter yang stabil, apa pun domain/path file gambarnya.
+      // Logo situs, ikon UI, dsb tidak punya alt text berpola begini, jadi
+      // otomatis tersaring.
+      const imgTagRegex = /<img\b[^>]*>/gi;
+      const allImgTags = html.match(imgTagRegex) || [];
+
+      const comicImages = [];
+      let idx = 0;
+      for (const tag of allImgTags) {
+        const srcMatch = tag.match(/\bsrc="([^"]+)"/i);
+        const altMatch = tag.match(/\balt="([^"]*)"/i);
+        if (!srcMatch) continue;
+        const alt = altMatch ? altMatch[1] : "";
+        // Alt konten chapter selalu diakhiri nomor halaman (contoh: "... 182화 1", "... 182화 2")
+        if (!/\s\d+$/.test(alt.trim())) continue;
+        idx++;
+        comicImages.push({ page: idx, url: srcMatch[1], alt });
+      }
+
+      if (comicImages.length === 0) {
+        return new Response(
+          JSON.stringify({
+            error: "No comic images found in jjaptoon chapter page",
+            note: "Expected <img alt=\"...{page number}\"> tags matching the chapter's page numbering. The site may have changed its markup entirely (not just the CDN path).",
+            debug: { chapterId, comicTitle, chapterTitle, pageTitle, url: successUrl, totalImgTagsFound: allImgTags.length }
+          }),
+          { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
+        );
+      }
+
+      const result = {
+        source: "jjaptoon",
+        chapter_id: parseInt(chapterId),
+        comic_title: comicTitle,
+        chapter_title: chapterTitle,
+        page_title: pageTitle,
+        total_images: comicImages.length,
+        images: comicImages.map((img) => ({
+          page: img.page,
+          url: img.url,
+          alt: img.alt
+        }))
+      };
+
+      return new Response(JSON.stringify(result, null, 2), {
+        status: 200,
+        headers: { ...corsHeaders(request), "Content-Type": "application/json" }
+      });
+    }
+
+    // jjabtoon: situs BEDA yang ditemukan terpisah dari jjaptoon (bukan
+    // situs pengganti — keduanya hidup berdampingan, dikonfirmasi user 2
+    // Sep 2026). Punya REST JSON API bersih di /api/episodes/{id} — TIDAK
+    // perlu scrape HTML <img alt> seperti jjaptoon. Path URL chapter-nya
+    // /episodes/{id} (beda dari jjaptoon yang /chapters/{id}). Diberi label
+    // source "jjabtoon" sendiri, TIDAK dicampur dengan "jjaptoon" lagi.
+    const jjabtoonMatch = targetUrl.href.match(/^https?:\/\/[^/]*jjabtoon[^/]*\/episodes\/(\d+)/);
+    if (jjabtoonMatch) {
+      const episodeId = jjabtoonMatch[1];
 
       // Domain jjabtoon bernomor (jjabtoon001.com, dst) dan bisa berubah
-      // dari waktu ke waktu seperti jjaptoon lama. Coba origin dari URL asli
-      // dulu (paling mungkin domain yang sedang aktif untuk user), baru
-      // fallback ke jjabtoon001.com kalau gagal — bukan hardcode satu nomor
-      // saja, supaya tahan kalau nomor default berubah lagi nanti.
+      // dari waktu ke waktu. Coba origin dari URL asli dulu (paling mungkin
+      // domain yang sedang aktif untuk user), baru fallback ke
+      // jjabtoon001.com kalau gagal — bukan hardcode satu nomor saja,
+      // supaya tahan kalau nomor default berubah lagi nanti.
       const origin = targetUrl.origin;
       const apiUrlsToTry = [
         `${origin}/api/episodes/${episodeId}`,
@@ -392,7 +528,7 @@ export default {
       if (!apiData) {
         return new Response(
           JSON.stringify({
-            error: "Jjaptoon (jjabtoon) chapter not found",
+            error: "Jjabtoon chapter not found",
             detail: lastError || "All API URLs failed",
             tried: apiUrlsToTry
           }),
@@ -421,7 +557,7 @@ export default {
       const chapterTitle = apiData.title || (apiData.episodeNo != null ? `${apiData.episodeNo}화` : `Episode ${episodeId}`);
 
       const result = {
-        source: "jjaptoon",
+        source: "jjabtoon",
         chapter_id: parseInt(episodeId),
         comic_title: "",
         chapter_title: chapterTitle,
@@ -440,16 +576,86 @@ export default {
       });
     }
 
-    // jjaptoon/jjabtoon: URL SERIES (bukan chapter). Situs BARU (sejak 2 Sep
-    // 2026) punya REST JSON API bersih — TIDAK perlu lagi scrape HTML.
-    // Path URL series juga berubah dari /comics/{id} ke /webtoons/{id}.
-    // Dua panggilan API dibutuhkan: metadata series (/api/webtoons/{id})
-    // dan daftar episode (/api/webtoons/{id}/episodes) — dikonfirmasi lewat
-    // network capture manual, list episode dari API sudah terurut
-    // terbaru->terlama (episodeNo turun), tidak perlu sorting ulang.
-    const jjaptoonSeriesMatch = targetUrl.href.match(/^https?:\/\/[^/]*jja[pb]toon[^/]*\/webtoons\/(\d+)/);
+    // jjaptoon: URL SERIES (bukan chapter), situs LAMA yang tetap hidup.
+    // Halaman series (Livewire/PHP, server-side rendered) menampilkan SEMUA
+    // chapter langsung di satu halaman HTML — sudah diverifikasi manual
+    // pakai sampel 49 chapter dan 193 chapter, keduanya cocok persis dengan
+    // jumlah "총 N화" yang tertulis di halaman, tanpa pagination/load-more
+    // dan tanpa duplikat. Tiap chapter link berpola:
+    //   <a href="/chapters/{id}" data-chapter-list-id="{id}" ...>
+    //     ...<p class="truncate text-sm font-black text-zinc-100">{judul}</p>
+    // Domain jjaptoon sering berganti (003, 005, dst, dan bisa juga TLD
+    // beda) — dicocokkan lewat pola generik yang sama dengan handler
+    // chapter di atas, bukan hardcode satu domain.
+    //
+    // Catatan: format judul chapter TIDAK seragam (kadang pakai judul komik
+    // di depan, kadang cuma nomor, kadang ada prefix angka lama seperti
+    // "0037 - 37화 : ..."), tapi semua format itu tetap punya digit yang
+    // konsisten dengan nomor chapter aslinya, jadi tidak perlu normalisasi
+    // khusus di sini — biarkan title apa adanya, ekstraksi nomor (kalau
+    // dibutuhkan fitur rentang) sudah ditangani generik di sisi frontend.
+    const jjaptoonSeriesMatch = targetUrl.href.match(/^https?:\/\/[^/]*jjaptoon[^/]*\/comics\/(\d+)/);
     if (jjaptoonSeriesMatch) {
-      const webtoonId = jjaptoonSeriesMatch[1];
+      const comicId = jjaptoonSeriesMatch[1];
+
+      const pageHeaders = new Headers();
+      pageHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
+      pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+      pageHeaders.set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7");
+      pageHeaders.set("Referer", targetUrl.origin + "/");
+
+      try {
+        const pageRes = await safeFetch(targetUrl.toString(), { method: "GET", headers: pageHeaders });
+        if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
+        const html = await pageRes.text();
+
+        const chapterLinkRe = /href="\/chapters\/(\d+)"[^>]*data-chapter-list-id="\d+"[\s\S]*?<p class="truncate text-sm font-black text-zinc-100">([^<]+)<\/p>/g;
+
+        const chapters = [];
+        let m;
+        while ((m = chapterLinkRe.exec(html)) !== null) {
+          const [, chapterId, title] = m;
+          chapters.push({
+            chapter_id: chapterId,
+            chapter_title: title.trim(),
+            url: `${targetUrl.origin}/chapters/${chapterId}`
+          });
+        }
+
+        if (chapters.length === 0) {
+          return new Response(
+            JSON.stringify({
+              error: "No chapters found in jjaptoon series page",
+              note: "Expected <a href=\"/chapters/{id}\" data-chapter-list-id=\"...\"> links with a following <p class=\"truncate text-sm font-black text-zinc-100\"> title. The site may have changed its markup.",
+              debug: { comicId }
+            }),
+            { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
+          );
+        }
+
+        return new Response(JSON.stringify({
+          source: "jjaptoon",
+          type: "series",
+          comic_id: comicId,
+          total_chapters: chapters.length,
+          chapters
+        }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "jjaptoon series fetch failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      }
+    }
+
+    // jjabtoon: URL SERIES (bukan chapter), situs BEDA dari jjaptoon (lihat
+    // catatan lengkap di handler chapter jjabtoon di atas). Punya REST JSON
+    // API bersih — TIDAK perlu scrape HTML. Path series-nya /webtoons/{id}
+    // (beda dari jjaptoon yang /comics/{id}). Dua panggilan API dibutuhkan:
+    // metadata series (/api/webtoons/{id}) dan daftar episode
+    // (/api/webtoons/{id}/episodes) — dikonfirmasi lewat network capture
+    // manual, list episode dari API sudah terurut terbaru->terlama
+    // (episodeNo turun), tidak perlu sorting ulang.
+    const jjabtoonSeriesMatch = targetUrl.href.match(/^https?:\/\/[^/]*jjabtoon[^/]*\/webtoons\/(\d+)/);
+    if (jjabtoonSeriesMatch) {
+      const webtoonId = jjabtoonSeriesMatch[1];
       const origin = targetUrl.origin;
 
       const apiHeaders = new Headers();
@@ -497,7 +703,7 @@ export default {
         }));
 
         return new Response(JSON.stringify({
-          source: "jjaptoon",
+          source: "jjabtoon",
           type: "series",
           comic_title: meta.title || "",
           cover: meta.thumbnailUrl || "",
@@ -508,7 +714,7 @@ export default {
           chapters
         }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
       } catch (err) {
-        return new Response(JSON.stringify({ error: "jjaptoon (jjabtoon) series fetch failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+        return new Response(JSON.stringify({ error: "jjabtoon series fetch failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
       }
     }
 

@@ -1086,10 +1086,30 @@ export default {
           );
         }
 
+        // Cover: halaman series tidak punya tag og:image — heuristik yang
+        // terverifikasi: gambar /attachment/scraping/ yang paling sering
+        // muncul adalah poster komiknya (di-render 2×: background + poster),
+        // sedangkan logo/ikon platform hanya 1× dan beda path. Best-effort:
+        // kalau tidak ketemu, cover dikosongkan (frontend tampilkan placeholder).
+        let seriesCover = "";
+        try {
+          const imgUrls = [...html.matchAll(/<img[^>]*src="([^"]+)"/gi)].map((x) => x[1]);
+          const freq = new Map();
+          for (const u of imgUrls) {
+            if (!u.includes("/attachment/scraping/")) continue;
+            freq.set(u, (freq.get(u) || 0) + 1);
+          }
+          let bestCount = 1;
+          for (const [u, n] of freq) {
+            if (n > bestCount) { bestCount = n; seriesCover = u; }
+          }
+        } catch {}
+
         return new Response(JSON.stringify({
           source: "jjaptoon",
           type: "series",
           comic_id: comicId,
+          cover: seriesCover,
           total_chapters: chapters.length,
           chapters
         }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
@@ -1499,10 +1519,20 @@ export default {
           );
         }
 
+        // Cover: <amp-img> pertama di halaman adalah poster komiknya
+        // (terverifikasi; yang kedua dst. cuma placeholder). Abaikan kalau
+        // isinya cover default generik — frontend tampilkan placeholder saja.
+        let seriesCover = "";
+        const coverMatch = html.match(/<amp-img[^>]*src="([^"]+)"/i);
+        if (coverMatch && !coverMatch[1].includes("default_cover")) {
+          seriesCover = coverMatch[1].replace(/&amp;/g, "&");
+        }
+
         return new Response(JSON.stringify({
           source: "baozimh",
           type: "series",
           comic_slug: comicSlug,
+          cover: seriesCover,
           total_chapters: chapters.length,
           chapters
         }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
@@ -1802,10 +1832,29 @@ export default {
           url: `https://www.wmanhua.com/chapter/${ch.contentId}-${ch.id}.html`
         }));
 
+        // Cover TIDAK ada di respons API (cuma chapters) — ambil best-effort
+        // dari halaman HTML series (<img class="cover lazy" data-src>).
+        // Kegagalan di sini tidak menggagalkan daftar chapter.
+        let seriesCover = "";
+        try {
+          const pageHeaders = new Headers();
+          pageHeaders.set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
+          pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+          pageHeaders.set("Referer", "https://www.wmanhua.com/");
+          const pageRes = await safeFetch(`https://www.wmanhua.com/comic/${comicId}.html`, { method: "GET", headers: pageHeaders });
+          if (pageRes.ok) {
+            const pageHtml = await pageRes.text();
+            const coverMatch = pageHtml.match(/<img[^>]*class="cover lazy"[^>]*data-src="([^"]+)"/i) ||
+              pageHtml.match(/<img[^>]*data-src="([^"]+)"[^>]*class="cover lazy"/i);
+            if (coverMatch) seriesCover = coverMatch[1];
+          }
+        } catch {}
+
         return new Response(JSON.stringify({
           source: "wmanhua",
           type: "series",
           comic_id: parseInt(comicId),
+          cover: seriesCover,
           total_chapters: chapters.length,
           chapters
         }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});

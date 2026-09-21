@@ -4,14 +4,19 @@
 // DAN domain CDN gambarnya (kalau beda) di daftar ini.
 // Tidak ada
 // jjaptoon sengaja diperlakukan khusus: situsnya rutin pindah domain, dan
-// bukan cuma nomornya yang berubah (jjaptoon003, 004, 005, dst) — TLD-nya
+// bukan cuma nomornya yang berubah (jjaptoon003, 004, 005, 008, dst) — TLD-nya
 // juga ikut berganti (sudah pernah dipakai: .com, .net; kemungkinan .vip
 // juga pernah dipakai). CDN gambarnya juga ikut domain utama yang aktif
 // saat itu (misal www.jjaptoon.net/comics-imported/...). Exact-match akan
 // selalu ketinggalan kombinasi terbaru, jadi dicocokkan lewat pola yang
 // menerima nomor opsional + salah satu TLD dari daftar yang pernah teramati.
 // Kalau situsnya pindah ke TLD baru lagi di luar daftar ini, tambahkan di sini.
-const JJAPTOON_HOST_RE = /^(www\.)?jjaptoon\d*\.(com|net|vip|xyz|top|me)$/;
+//
+// KOREKSI Sep 2026: CDN gambar domain 008 adalah img.jjaptoon008.com
+// (diverifikasi 94/94 gambar chapter dari sana) — prefix img. WAJIB diterima,
+// kalau tidak unduhan gambar chapter diblokir allowlist dengan 403 padahal
+// metadata-nya berhasil.
+const JJAPTOON_HOST_RE = /^((www|img)\.)?jjaptoon\d*\.(com|net|vip|xyz|top|me)$/;
 
 // KOREKSI 2 September 2026: sempat salah diasumsikan "jjaptoon berganti
 // nama total jadi jjabtoon" — TERNYATA SALAH. jjaptoon sempat error/down
@@ -40,6 +45,19 @@ const JJABTOON_HOST_RE = /^(www\.|cdn\.)?jjabtoon\d*\.(com|net|vip|xyz|top|me)$/
 // Kalau nanti muncul domain inti ketiga, tambahkan ke grup di bawah.
 const APPGB_HOST_RE = /^appgb\d*\.(baozimh\.com|bzmgapp\.com)$/;
 
+// GoodToon: tema WordPress Madara (dikonfirmasi lewat network capture user
+// 3 Sep 2026 — endpoint ajax/chapters/, class wp-manga-chapter-img, dll,
+// semua ciri khas Madara). Nomor domain bisa berganti seperti jjaptoon
+// (dikonfirmasi user: goodtoon002, goodtoon003, dst) — dicocokkan lewat
+// pola nomor opsional, bukan exact-match. Halaman utama dan CDN gambar
+// ada di DUA DOMAIN BERBEDA TOTAL (bukan subdomain seperti jjabtoon):
+// contoh nyata dari network capture: www.goodtoon002.com (halaman) vs
+// img.goodtoon9001.top (CDN gambar) — nomor dan bahkan TLD-nya beda
+// (.com vs .top), jadi diberi 2 regex terpisah, bukan satu regex dengan
+// grup prefix seperti jjabtoon punya cdn.
+const GOODTOON_HOST_RE = /^(www\.)?goodtoon\d*\.(com|net|top|xyz)$/;
+const GOODTOON_CDN_HOST_RE = /^img\.goodtoon\d*\.(com|net|top|xyz)$/;
+
 const ALLOWED_HOST_SUFFIXES = [
   "twmanga.com",
   "baozimh.com",
@@ -63,6 +81,8 @@ function isHostAllowed(hostname) {
   const h = hostname.toLowerCase();
   if (JJAPTOON_HOST_RE.test(h)) return true;
   if (JJABTOON_HOST_RE.test(h)) return true;
+  if (GOODTOON_HOST_RE.test(h)) return true;
+  if (GOODTOON_CDN_HOST_RE.test(h)) return true;
   if (APPGB_HOST_RE.test(h)) return true;
   return ALLOWED_HOST_SUFFIXES.some((suffix) => h === suffix || h.endsWith("." + suffix));
 }
@@ -268,6 +288,339 @@ async function safeFetch(url, options = {}, maxRedirects = 5) {
   }
 }
 
+function jsonResponse(request, data, status = 200) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: { ...corsHeaders(request), "Content-Type": "application/json" }
+  });
+}
+
+async function handleSearch(request, reqUrl) {
+  const source = (reqUrl.searchParams.get("source") || "").toLowerCase();
+  const query = (reqUrl.searchParams.get("q") || "").trim();
+
+  if (!query) {
+    return jsonResponse(request, { error: "Missing ?q= (kata kunci pencarian)" }, 400);
+  }
+  if (query.length > 100) {
+    return jsonResponse(request, { error: "Kata kunci terlalu panjang (maks 100 karakter)" }, 400);
+  }
+
+  try {
+    if (source === "baozimh") return await searchBaozimh(request, query);
+    if (source === "wmanhua") return await searchWmanhua(request, query);
+    if (source === "jjabtoon") return await searchJjabtoon(request, reqUrl, query);
+    if (source === "koudaimh") return await searchKoudaimh(request, query);
+    if (source === "jjaptoon") return await searchJjaptoon(request, reqUrl, query);
+    if (source === "goodtoon") return await searchGoodtoon(request, reqUrl, query);
+    return jsonResponse(request, {
+      error: "Sumber pencarian tidak didukung",
+      detail: "Pilih salah satu: baozimh, wmanhua, jjabtoon, koudaimh, jjaptoon, goodtoon."
+    }, 400);
+  } catch (err) {
+    return jsonResponse(request, { error: `${source || "search"} search failed`, detail: err.message }, 502);
+  }
+}
+
+// Baozimh: halaman publik GET www.baozimh.com/search?q= (tidak butuh header
+// app). Tiap hasil: <a href="/comic/{slug}" title="{judul}"
+// class="comics-card__poster ..."><amp-img src="{cover}"> — dicocokkan lewat
+// class poster supaya tiap komik tepat satu entri (link info di bawahnya
+// diduplikat di HTML, di-dedupe via slug).
+async function searchBaozimh(request, query) {
+  const headers = new Headers();
+  headers.set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
+  headers.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+  headers.set("Referer", "https://www.baozimh.com/");
+
+  const url = "https://www.baozimh.com/search?q=" + encodeURIComponent(query);
+  const res = await safeFetch(url, { method: "GET", headers });
+  if (!res.ok) throw new Error(`HTTP ${res.status} pada halaman pencarian`);
+  const html = await res.text();
+
+  const re = /<a href="\/comic\/([^"?#]+)"[^>]*title="([^"]+)"[^>]*class="comics-card__poster[^"]*"[\s\S]*?<amp-img[^>]*src="([^"]+)"/gi;
+  const seen = new Set();
+  const results = [];
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const slug = m[1].trim();
+    if (!slug || seen.has(slug)) continue;
+    seen.add(slug);
+    results.push({
+      title: m[2].trim(),
+      url: `https://www.baozimh.com/comic/${slug}`,
+      cover: m[3].replace(/&amp;/g, "&"),
+      author: ""
+    });
+    if (results.length >= 30) break;
+  }
+
+  return jsonResponse(request, { source: "baozimh", query, total: results.length, results });
+}
+
+// Wmanhua: halaman publik GET www.wmanhua.com/search?query=. Tiap hasil:
+// <a href="/comic/{id}.html"><article class="card"><img class="lazy"
+// data-src="{cover}" ... alt="{judul}"> — cover di image*.wmanhua.com sudah
+// tercakup allowlist (subdomain wmanhua.com).
+async function searchWmanhua(request, query) {
+  const headers = new Headers();
+  headers.set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
+  headers.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+  headers.set("Referer", "https://www.wmanhua.com/");
+
+  const url = "https://www.wmanhua.com/search?query=" + encodeURIComponent(query);
+  const res = await safeFetch(url, { method: "GET", headers });
+  if (!res.ok) throw new Error(`HTTP ${res.status} pada halaman pencarian`);
+  const html = await res.text();
+
+  const re = /<a href="(\/comic\/\d+\.html)">[\s\S]*?data-src="([^"]+)"[\s\S]*?alt="([^"]+)"/gi;
+  const seen = new Set();
+  const results = [];
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const path = m[1];
+    if (seen.has(path)) continue;
+    seen.add(path);
+    results.push({
+      title: m[3].trim(),
+      url: `https://www.wmanhua.com${path}`,
+      cover: m[2].trim(),
+      author: ""
+    });
+    if (results.length >= 30) break;
+  }
+
+  return jsonResponse(request, { source: "wmanhua", query, total: results.length, results });
+}
+
+// Jjabtoon: REST JSON GET {origin}/api/webtoons?search= (terverifikasi respon
+// { success, data: [{ id, title, thumbnailUrl, authorName, genre }] }).
+// URL series memakai id numerik (/webtoons/{id}) sesuai handler series yang
+// sudah ada. Parameter opsional &host= untuk domain bernomor yang sedang
+// aktif, divalidasi JJABTOON_HOST_RE seperti biasa.
+async function searchJjabtoon(request, reqUrl, query) {
+  let origin = "https://jjabtoon001.com";
+  const hostParam = (reqUrl.searchParams.get("host") || "").trim().toLowerCase();
+  if (hostParam) {
+    if (!JJABTOON_HOST_RE.test(hostParam)) {
+      return jsonResponse(request, { error: "Parameter host tidak diizinkan", detail: hostParam }, 400);
+    }
+    origin = `https://${hostParam}`;
+  }
+
+  const headers = new Headers();
+  headers.set("Accept", "application/json, text/plain, */*");
+  headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
+  headers.set("Referer", origin + "/");
+
+  const url = `${origin}/api/webtoons?search=` + encodeURIComponent(query);
+  const res = await safeFetch(url, { method: "GET", headers });
+  if (!res.ok) throw new Error(`HTTP ${res.status} pada API pencarian`);
+  const json = await res.json();
+  if (!json || !json.success || !Array.isArray(json.data)) {
+    throw new Error("API pencarian mengembalikan format tak dikenal");
+  }
+
+  const results = json.data.slice(0, 30).map((item) => ({
+    title: item.title || `Webtoon ${item.id}`,
+    url: `${origin}/webtoons/${item.id}`,
+    cover: item.thumbnailUrl || "",
+    author: item.authorName || ""
+  }));
+
+  return jsonResponse(request, { source: "jjabtoon", query, total: results.length, results });
+}
+
+// Koudaimh: pencarian butuh 2 langkah karena form-nya menyertakan token
+// anti-CSRF (__searchtoken__) yang berbeda tiap pemuatan halaman
+// (terverifikasi: token saja cukup, tidak perlu cookie sesi):
+//   1. GET m.koudaimh.com/search → ambil token dari input hidden;
+//   2. GET m.koudaimh.com/search?q={kata}&__searchtoken__={token} → hasil:
+//      <a href="/manhua/{slug}" title="{judul}" class="block ...">
+//      ...<img src="{cover}">
+// Origin ini kadang membalas 502 sesaat (teramati dari probe), jadi langkah
+// 1 diberi satu kali retry sebelum menyerah. Cover di img.koudaimh.com sudah
+// tercakup allowlist (subdomain koudaimh.com).
+async function searchKoudaimh(request, query) {
+  const UA = "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36";
+
+  async function fetchLanding() {
+    const headers = new Headers();
+    headers.set("User-Agent", UA);
+    headers.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+    headers.set("Referer", "https://m.koudaimh.com/");
+    const res = await safeFetch("https://m.koudaimh.com/search", { method: "GET", headers });
+    if (!res.ok) throw new Error(`HTTP ${res.status} pada halaman pencarian`);
+    return res.text();
+  }
+
+  let landing;
+  try {
+    landing = await fetchLanding();
+  } catch (firstErr) {
+    // Retry sekali — origin Koudaimh sesekali 502 sepersekian detik.
+    try {
+      landing = await fetchLanding();
+    } catch {
+      throw firstErr;
+    }
+  }
+
+  const tokenMatch = landing.match(/name="__searchtoken__" value="([^"]+)"/);
+  if (!tokenMatch) {
+    throw new Error("Token pencarian tidak ditemukan (struktur halaman berubah?)");
+  }
+
+  const headers = new Headers();
+  headers.set("User-Agent", UA);
+  headers.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+  headers.set("Referer", "https://m.koudaimh.com/search");
+
+  const url = "https://m.koudaimh.com/search?q=" + encodeURIComponent(query) +
+    "&__searchtoken__=" + encodeURIComponent(tokenMatch[1]);
+  const res = await safeFetch(url, { method: "GET", headers });
+  if (!res.ok) throw new Error(`HTTP ${res.status} pada hasil pencarian`);
+  const html = await res.text();
+
+  const re = /<a href="\/manhua\/([^"?#\/]+)\/?"[^>]*title="([^"]+)"[^>]*class="block[\s\S]*?<img[^>]*src="([^"]+)"/gi;
+  const seen = new Set();
+  const results = [];
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const slug = m[1].trim();
+    if (!slug || seen.has(slug)) continue;
+    seen.add(slug);
+    results.push({
+      title: m[2].trim(),
+      url: `https://m.koudaimh.com/manhua/${slug}`,
+      cover: m[3].replace(/&amp;/g, "&"),
+      author: ""
+    });
+    if (results.length >= 30) break;
+  }
+
+  return jsonResponse(request, { source: "koudaimh", query, total: results.length, results });
+}
+
+// Jjaptoon: halaman publik GET {origin}/search?q= (form method GET,
+// input name="q", maxlength 100 — batas 100 karakter di handleSearch
+// konsisten dengan itu). Tiap hasil:
+//   <a href="/comics/{id}" class="group relative block aspect-[5/8] ...">
+//   ...<img src="{cover}" ... alt="{judul}">
+// Domain default adalah yang terakhir dikonfirmasi hidup (008 per Sep 2026);
+// kalau situsnya pindah lagi, update default ini ATAU kirim &host= yang
+// divalidasi JJAPTOON_HOST_RE.
+async function searchJjaptoon(request, reqUrl, query) {
+  let origin = "https://www.jjaptoon008.com";
+  const hostParam = (reqUrl.searchParams.get("host") || "").trim().toLowerCase();
+  if (hostParam) {
+    if (!JJAPTOON_HOST_RE.test(hostParam)) {
+      return jsonResponse(request, { error: "Parameter host tidak diizinkan", detail: hostParam }, 400);
+    }
+    origin = `https://${hostParam}`;
+  }
+
+  const headers = new Headers();
+  headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
+  headers.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+  headers.set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7");
+  headers.set("Referer", origin + "/");
+
+  const url = `${origin}/search?q=` + encodeURIComponent(query);
+  const res = await safeFetch(url, { method: "GET", headers });
+  if (!res.ok) throw new Error(`HTTP ${res.status} pada halaman pencarian`);
+  const html = await res.text();
+
+  const re = /<a href="(\/comics\/\d+)" class="group relative block aspect-\[5\/8\][\s\S]*?<img[^>]*src="([^"]+)"[^>]*alt="([^"]*)"/gi;
+  const seen = new Set();
+  const results = [];
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const path = m[1];
+    if (seen.has(path)) continue;
+    seen.add(path);
+    results.push({
+      title: (m[3] || "").trim() || path,
+      url: `${origin}${path}`,
+      cover: m[2].trim(),
+      author: ""
+    });
+    if (results.length >= 30) break;
+  }
+
+  return jsonResponse(request, { source: "jjaptoon", query, total: results.length, results });
+}
+
+// GoodToon: pencarian memakai parameter WordPress ?s=, TAPI entry point-nya
+// lewat redirector https://goodtoon.top/ (milik pengelola, selalu redirect
+// 301 ke domain web aktif — terverifikasi goodtoon.top/?s=... →
+// www.goodtoon004.com/?s=... → hasil). safeFetch mengikuti redirect-nya
+// otomatis (kedua hop lolos allowlist), jadi pencarian tetap jalan walau
+// domain web-nya pindah lagi tanpa update kode. Fallback:
+// www.goodtoon004.com kalau redirectornya mati. Parameter &host= opsional
+// (divalidasi GOODTOON_HOST_RE) untuk memaksa domain tertentu.
+// Tiap hasil: <a href=".../manga/{slug}/" ... class="card"> — judul diambil
+// dari alt cover, fallback ke <div class="subject"> karena kartu pertama
+// memakai ikon platform (alt kosong) sebelum cover aslinya.
+async function searchGoodtoon(request, reqUrl, query) {
+  const bases = [];
+  const hostParam = (reqUrl.searchParams.get("host") || "").trim().toLowerCase();
+  if (hostParam) {
+    if (!GOODTOON_HOST_RE.test(hostParam)) {
+      return jsonResponse(request, { error: "Parameter host tidak diizinkan", detail: hostParam }, 400);
+    }
+    bases.push(`https://${hostParam}`);
+  } else {
+    bases.push("https://goodtoon.top", "https://www.goodtoon004.com");
+  }
+
+  const headers = new Headers();
+  headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
+  headers.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+  headers.set("Referer", bases[0] + "/");
+
+  let html = null;
+  let lastError = null;
+  for (const base of bases) {
+    try {
+      const res = await safeFetch(`${base}/?s=` + encodeURIComponent(query), { method: "GET", headers });
+      if (!res.ok) {
+        lastError = new Error(`HTTP ${res.status} pada ${base}`);
+        continue;
+      }
+      html = await res.text();
+      break;
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  if (html === null) throw lastError || new Error("Semua basis pencarian GoodToon gagal");
+
+  const cardRe = /<a href="(https?:\/\/[^/]*goodtoon[^/]*\/manga\/[^"?#]+\/?)"[^>]*class="card">([\s\S]*?)<\/a>/gi;
+  const seen = new Set();
+  const results = [];
+  let m;
+  while ((m = cardRe.exec(html)) !== null) {
+    const pageUrl = m[1];
+    if (seen.has(pageUrl)) continue;
+    seen.add(pageUrl);
+    const inner = m[2];
+    const coverMatch = inner.match(/<img src="(https:\/\/img\.goodtoon[^"]+)" alt="([^"]*)"/i);
+    const subjectMatch = inner.match(/<div class="subject">([^<]+)<\/div>/i);
+    const title = ((coverMatch && coverMatch[2].trim()) || (subjectMatch && subjectMatch[1].trim()) || "");
+    if (!title) continue;
+    results.push({
+      title,
+      url: pageUrl,
+      cover: coverMatch ? coverMatch[1] : "",
+      author: ""
+    });
+    if (results.length >= 30) break;
+  }
+
+  return jsonResponse(request, { source: "goodtoon", query, total: results.length, results });
+}
+
 export default {
   async fetch(request, env) {
     const reqUrl = new URL(request.url);
@@ -294,6 +647,24 @@ export default {
 
     const target = reqUrl.searchParams.get("url") || reqUrl.searchParams.get("u");
     const referer = reqUrl.searchParams.get("referer") || reqUrl.searchParams.get("ref") || "";
+
+    // PENCARIAN JUDUL (fitur baru, dipakai panel "Cari Judul" di frontend):
+    //   ?action=search&source={baozimh|wmanhua|jjabtoon}&q={kata kunci}[&host=...]
+    // Mengembalikan daftar SERIES (bukan chapter) supaya hasilnya bisa
+    // langsung dibuka lewat alur series picker yang sudah ada:
+    //   { source, query, total, results: [{ title, url, cover, author }] }
+    // Hanya sumber yang endpoint pencariannya sudah terverifikasi manual yang
+    // didukung (baozimh: GET /search?q=, wmanhua: GET /search?query=,
+    // jjabtoon: GET /api/webtoons?search=, koudaimh: 2 langkah
+    // GET /search lalu GET /search?q=&__searchtoken__=,
+    // jjaptoon: GET /search?q=, goodtoon: GET /?s= via goodtoon.top yang
+    // redirect otomatis ke domain aktif). Manwa SENGAJA tidak disediakan:
+    // situsnya memang tidak punya menu pencarian sama sekali (diverifikasi
+    // user dari akses langsung + 403 dari probe luar) — daripada
+    // mengembalikan hasil palsu/rusak.
+    if ((reqUrl.searchParams.get("action") || "").toLowerCase() === "search") {
+      return handleSearch(request, reqUrl);
+    }
 
     if (!target) {
       return new Response("Missing ?url=", { status: 400, headers: corsHeaders(request) });
@@ -340,13 +711,14 @@ export default {
     if (jjaptoonMatch) {
       const chapterId = jjaptoonMatch[1];
 
-      // Domain jjaptoon berubah dari waktu ke waktu (003, 004, dst, dan bisa
-      // juga TLD beda). Coba URL asli dulu, baru fallback ke domain umum
-      // tanpa nomor kalau gagal.
+      // Domain jjaptoon berubah dari waktu ke waktu (003, 004, 008, dst, dan
+      // bisa juga TLD beda). Coba URL asli tempelan user dulu (paling mungkin
+      // domain aktif), baru fallback ke domain terakhir yang dikonfirmasi
+      // hidup. Update fallback ini kalau domain pindah lagi.
       const urlsToTry = [
         targetUrl.toString(),
-        `https://www.jjaptoon.com/chapters/${chapterId}`,
-        `https://jjaptoon.com/chapters/${chapterId}`
+        `https://www.jjaptoon008.com/chapters/${chapterId}`,
+        `https://jjaptoon008.com/chapters/${chapterId}`
       ];
 
       let lastError = null;
@@ -576,7 +948,88 @@ export default {
       });
     }
 
-    // jjaptoon: URL SERIES (bukan chapter), situs LAMA yang tetap hidup.
+    // GoodToon: tema WordPress Madara — HTML server-side render biasa,
+    // TIDAK ada JSON API untuk chapter (beda dari jjabtoon). Gambar
+    // di-lazyload lewat atribut data-src (bukan src langsung), jadi harus
+    // ambil dari data-src, bukan src. URL chapter TIDAK konsisten satu
+    // pola: kadang /{nomor}/ polos (misal /58/), kadang /chapter-{nomor}/
+    // (misal /chapter-56/) — dikonfirmasi dari network capture user, kedua
+    // pola ini hidup berdampingan di comic yang sama. Regex path menerima
+    // keduanya sekaligus.
+    const goodtoonMatch = targetUrl.href.match(/^https?:\/\/[^/]*goodtoon[^/]*\/manga\/([^/?#]+)\/(?:chapter-)?(\d+)\/?(?:[?#].*)?$/);
+    if (goodtoonMatch) {
+      const comicSlug = goodtoonMatch[1];
+      const chapterNum = goodtoonMatch[2];
+
+      const pageHeaders = new Headers();
+      pageHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
+      pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+      pageHeaders.set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7");
+      pageHeaders.set("Referer", targetUrl.origin + "/");
+
+      try {
+        const pageRes = await safeFetch(targetUrl.toString(), { method: "GET", headers: pageHeaders });
+        if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
+        const html = await pageRes.text();
+
+        const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+        const pageTitle = titleMatch ? titleMatch[1].trim() : "";
+
+        let comicTitle = "";
+        let chapterTitle = "";
+        if (pageTitle.includes(" - ")) {
+          const parts = pageTitle.split(" - ");
+          comicTitle = parts[0].trim();
+          chapterTitle = parts[1].trim();
+        } else {
+          chapterTitle = pageTitle;
+        }
+
+        // Gambar chapter di-lazyload: URL asli ada di data-src, bukan src.
+        // Class wp-manga-chapter-img dikonfirmasi cuma dipakai untuk gambar
+        // konten chapter (bukan logo/ikon situs) — lihat verifikasi manual
+        // di sampel chapter 58 (141 gambar, semua dari domain img.goodtoon*
+        // yang sama, tidak ada gambar decoy tercampur).
+        const imgTagRegex = /<img\b[^>]*class="[^"]*\bwp-manga-chapter-img\b[^"]*"[^>]*>/gi;
+        const allImgTags = html.match(imgTagRegex) || [];
+
+        const comicImages = [];
+        for (const tag of allImgTags) {
+          const srcMatch = tag.match(/\bdata-src="([^"]+)"/i);
+          if (!srcMatch) continue;
+          comicImages.push(srcMatch[1]);
+        }
+
+        if (comicImages.length === 0) {
+          return new Response(
+            JSON.stringify({
+              error: "No comic images found in goodtoon chapter page",
+              note: "Expected <img class=\"...wp-manga-chapter-img...\" data-src=\"...\"> tags. The site may have changed its markup (e.g. switched away from lazyload, or renamed the class).",
+              debug: { comicSlug, chapterNum, comicTitle, chapterTitle, pageTitle, totalImgTagsFound: allImgTags.length }
+            }),
+            { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
+          );
+        }
+
+        const result = {
+          source: "goodtoon",
+          chapter_id: parseInt(chapterNum),
+          comic_slug: comicSlug,
+          comic_title: comicTitle,
+          chapter_title: chapterTitle,
+          page_title: pageTitle,
+          total_images: comicImages.length,
+          images: comicImages.map((url, i) => ({ page: i + 1, url }))
+        };
+
+        return new Response(JSON.stringify(result, null, 2), {
+          status: 200,
+          headers: { ...corsHeaders(request), "Content-Type": "application/json" }
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "goodtoon chapter fetch failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      }
+    }
     // Halaman series (Livewire/PHP, server-side rendered) menampilkan SEMUA
     // chapter langsung di satu halaman HTML — sudah diverifikasi manual
     // pakai sampel 49 chapter dan 193 chapter, keduanya cocok persis dengan
@@ -718,6 +1171,127 @@ export default {
       }
     }
 
+    // GoodToon: URL SERIES (bukan chapter). Tema Madara TIDAK menaruh daftar
+    // chapter di HTML halaman series langsung — daftar chapter di-load lewat
+    // endpoint AJAX terpisah (POST {origin}/manga/{slug}/ajax/chapters/?t=1),
+    // dikonfirmasi dari network capture user. Response-nya HTML fragment
+    // (bukan JSON!), tetap perlu di-scrape tapi dari fragment yang jauh
+    // lebih kecil & bersih daripada halaman utama. List sudah terurut
+    // terbaru->terlama dan sudah lengkap dalam satu response (tombol
+    // "더보기"/load-more di akhir fragment ternyata kosmetik saja — total
+    // <li class="wp-manga-chapter"> yang muncul sudah cocok dengan jumlah
+    // chapter asli, diverifikasi manual pakai sampel 58 chapter).
+    //
+    // Method HARUS POST dengan header X-Requested-With: XMLHttpRequest,
+    // kalau tidak Madara akan balas halaman HTML penuh atau reject —
+    // dikonfirmasi lewat requestHeaders di network capture.
+    //
+    // URL chapter dalam fragment ini TIDAK konsisten satu pola (kadang
+    // /{nomor}/, kadang /chapter-{nomor}/) — sama seperti yang sudah
+    // ditangani goodtoonMatch di atas, jadi cukup dipakai apa adanya dari
+    // href tanpa perlu normalisasi ulang di sini.
+    const goodtoonSeriesMatch = targetUrl.href.match(/^https?:\/\/[^/]*goodtoon[^/]*\/manga\/([^/?#]+)\/?(?:[?#].*)?$/);
+    if (goodtoonSeriesMatch) {
+      const comicSlug = goodtoonSeriesMatch[1];
+      const origin = targetUrl.origin;
+      const ajaxUrl = `${origin}/manga/${comicSlug}/ajax/chapters/?t=1`;
+
+      const ajaxHeaders = new Headers();
+      ajaxHeaders.set("Accept", "*/*");
+      ajaxHeaders.set("X-Requested-With", "XMLHttpRequest");
+      ajaxHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
+      ajaxHeaders.set("Referer", targetUrl.toString());
+
+      // Metadata series (cover, author, status) HANYA ada di halaman utama
+      // series, TIDAK ada di fragment AJAX chapter list — jadi dua request
+      // paralel dibutuhkan: satu untuk fragment chapter, satu untuk halaman
+      // utama (metadata).
+      const pageHeaders = new Headers();
+      pageHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
+      pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+      pageHeaders.set("Referer", origin + "/");
+
+      try {
+        const [ajaxRes, pageRes] = await Promise.all([
+          safeFetch(ajaxUrl, { method: "POST", headers: ajaxHeaders }),
+          safeFetch(targetUrl.toString(), { method: "GET", headers: pageHeaders })
+        ]);
+
+        if (!ajaxRes.ok) throw new Error(`HTTP ${ajaxRes.status} on chapter list ajax`);
+        const chaptersHtml = await ajaxRes.text();
+
+        const chapterLinkRe = /<a href="([^"]+)">\s*(?:<span class="up-badge-inline">UP<\/span>)?([^<]*)<\/a>/g;
+        const chapters = [];
+        let m;
+        while ((m = chapterLinkRe.exec(chaptersHtml)) !== null) {
+          const [, chapterUrl, rawTitle] = m;
+          // href chapter GoodToon berpola /manga/{slug}/{nomor}/ atau
+          // /manga/{slug}/chapter-{nomor}/ — dipakai buat chapter_id numerik.
+          // Toleran query/fragment di akhir href (?x=1, #anchor).
+          const idMatch = chapterUrl.match(/\/(?:chapter-)?(\d+)\/?(?:[?#].*)?$/);
+          if (!idMatch) continue;
+          chapters.push({
+            chapter_id: parseInt(idMatch[1]),
+            chapter_title: rawTitle.trim(),
+            url: chapterUrl
+          });
+        }
+
+        if (chapters.length === 0) {
+          return new Response(
+            JSON.stringify({
+              error: "No chapters found in goodtoon ajax chapter list",
+              note: "Expected <li class=\"wp-manga-chapter\"><a href=\"...\">...</a></li> entries. The site may have changed its markup or the ajax endpoint.",
+              debug: { comicSlug, ajaxUrl }
+            }),
+            { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
+          );
+        }
+
+        // Metadata dari halaman utama (opsional — kalau gagal, tetap balas
+        // daftar chapter tanpa metadata daripada gagal total).
+        let comicTitle = "";
+        let cover = "";
+        let author = "";
+        let status = "";
+
+        if (pageRes.ok) {
+          const pageHtml = await pageRes.text();
+          const titleMatch = pageHtml.match(/<h1 class="summary-title">([^<]+)<\/h1>/i);
+          if (titleMatch) comicTitle = titleMatch[1].trim();
+
+          const coverMatch = pageHtml.match(/<div class="manga-summary-cover">[\s\S]*?<img src="([^"]+)"/i);
+          if (coverMatch) cover = coverMatch[1];
+
+          const authorMatch = pageHtml.match(/<span class="author-text">([^<]+)<\/span>/i);
+          if (authorMatch) author = authorMatch[1].trim();
+
+          const statusMatch = pageHtml.match(/<span class="meta-value">([^<]+)<\/span>/i);
+          if (statusMatch) {
+            const rawStatus = statusMatch[1].trim();
+            // "연재중" (ongoing) / "완결" (completed) — sejauh ini cuma dua
+            // nilai yang teramati, nilai lain dibiarkan apa adanya kalau
+            // situs menambah status baru nanti.
+            status = rawStatus === "완결" ? "completed" : rawStatus === "연재중" ? "ongoing" : rawStatus;
+          }
+        }
+
+        return new Response(JSON.stringify({
+          source: "goodtoon",
+          type: "series",
+          comic_slug: comicSlug,
+          comic_title: comicTitle,
+          cover,
+          author,
+          status,
+          total_chapters: chapters.length,
+          chapters
+        }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "goodtoon series fetch failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      }
+    }
+
     // baozimh/twmanga: chapter diakses lewat www.twmanga.com, tapi datanya diambil dari appgb3.baozimh.com pakai header app khusus
     const baoziMatch = targetUrl.href.match(/(?:twmanga\.com|baozimh\.com)\/(?:comic\/chapter|baozimhapp\/comic\/chapter)\/([^/]+)\/([^/?#]+)\.html/);
     if (baoziMatch) {
@@ -728,11 +1302,18 @@ export default {
       // 1-2 host tetap — dikonfirmasi lewat observasi lintas kategori
       // (manhua mainland, manga, manhwa, komik barat) per 24 Agustus 2026.
       // Kombinasi yang aktif: nomor subdomain 1-3 × dua domain inti
-      // (bzmgapp.com, baozimh.com) = 6 kandidat. appgb1.bzmgapp.com paling
-      // sering "menang" secara keseluruhan, jadi ditaruh di urutan pertama
-      // supaya rata-rata butuh lebih sedikit percobaan sebelum berhasil.
-      // Dicoba berurutan (fallback chain), bukan paralel, supaya tidak
-      // boros request kalau kandidat pertama sudah berhasil.
+      // (baozimh.com, bzmgapp.com) = 6 kandidat. Dicoba berurutan (fallback
+      // chain), bukan paralel, supaya tidak boros request kalau kandidat
+      // pertama sudah berhasil.
+      // URUTAN 20 Sep 2026: baozimh.com DULU, bzmgapp.com belakangan.
+      // Alasannya: sertifikat TLS yang disajikan host appgb*.bzmgapp.com
+      // saat ini hanya CN=*.baozimh.com (tanpa SAN bzmgapp), sehingga fetch
+      // dengan verifikasi TLS strict (seperti di Cloudflare Workers) selalu
+      // gagal untuk ketiga host bzmgapp — diverifikasi langsung via curl
+      // (strict => 000/TLS error, insecure -k => 200). Kalau sertifikatnya
+      // diperbaiki di masa depan, kandidat bzmgapp otomatis bisa menang lagi
+      // tanpa perubahan kode, tapi untuk sekarang menaruhnya di depan hanya
+      // membuang 3x percobaan gagal sebelum sampai ke host yang hidup.
       // PENTING: Referer di bawah SENGAJA TIDAK ikut mengikuti kandidat
       // mana yang dipakai — app resmi tetap kirim Referer ke host generik
       // "appgb.baozimh.com" (tanpa angka) apa pun kombinasi yang berhasil,
@@ -742,7 +1323,7 @@ export default {
       // APPGB_HOST_RE di atas sudah general (appgb\d*) jadi allowlist tidak
       // perlu ikut diubah.
       const BAOZI_APP_SUBDOMAIN_NUMBERS = [1, 2, 3];
-      const BAOZI_APP_CORE_DOMAINS = ["bzmgapp.com", "baozimh.com"];
+      const BAOZI_APP_CORE_DOMAINS = ["baozimh.com", "bzmgapp.com"];
       const BAOZI_APP_HOST_CANDIDATES = BAOZI_APP_CORE_DOMAINS.flatMap((domain) =>
         BAOZI_APP_SUBDOMAIN_NUMBERS.map((n) => `appgb${n}.${domain}`)
       );
@@ -870,7 +1451,7 @@ export default {
     // ternyata tidak selalu strictly berurutan) — sudah diverifikasi
     // manual pakai sampel 402-chapter, hasilnya tetap benar setelah
     // dedupe+sort meski HTML mentahnya berantakan.
-    const baoziSeriesMatch = targetUrl.href.match(/^https?:\/\/(?:www\.)?baozimh\.com\/comic\/([^/?#]+)\/?$/i);
+    const baoziSeriesMatch = targetUrl.href.match(/^https?:\/\/(?:www\.)?(?:baozimh\.com|twmanga\.com)\/comic\/([^/?#]+)\/?(?:[?#].*)?$/i);
     if (baoziSeriesMatch) {
       const comicSlug = baoziSeriesMatch[1];
 
@@ -937,7 +1518,7 @@ export default {
     //   1. URL chapter (manwa.me/chapter/{id}) -> scrape halaman, balikin daftar url gambar
     //   2. URL gambar (mwappimgs.cc/...) -> fetch ciphertext, decrypt, serve sebagai webp
     const manwaChapterMatch = targetUrl.href.match(/^https?:\/\/(?:www\.)?manwa\.me\/chapter\/(\d+)/);
-    const manwaImageMatch = targetUrl.hostname.endsWith("mwappimgs.cc");
+    const manwaImageMatch = targetUrl.hostname === "mwappimgs.cc" || targetUrl.hostname.endsWith(".mwappimgs.cc");
 
     if (manwaChapterMatch) {
       const chapterId = manwaChapterMatch[1];

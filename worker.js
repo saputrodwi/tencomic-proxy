@@ -649,7 +649,7 @@ export default {
     const referer = reqUrl.searchParams.get("referer") || reqUrl.searchParams.get("ref") || "";
 
     // PENCARIAN JUDUL (fitur baru, dipakai panel "Cari Judul" di frontend):
-    //   ?action=search&source={baozimh|wmanhua|jjabtoon}&q={kata kunci}[&host=...]
+    //   ?action=search&source={baozimh|wmanhua|jjabtoon|koudaimh|jjaptoon|goodtoon}&q={kata kunci}[&host=...]
     // Mengembalikan daftar SERIES (bukan chapter) supaya hasilnya bisa
     // langsung dibuka lewat alur series picker yang sudah ada:
     //   { source, query, total, results: [{ title, url, cover, author }] }

@@ -328,15 +328,31 @@ async function handleSearch(request, reqUrl) {
 // class poster supaya tiap komik tepat satu entri (link info di bawahnya
 // diduplikat di HTML, di-dedupe via slug).
 async function searchBaozimh(request, query) {
+  // KOREKSI: www.baozimh.com memberlakukan gatekeeper challenge untuk
+  // fetch server-side (lihat catatan di handler series) — /search di sana
+  // ikut 403. www.twmanga.com melayani halaman pencarian yang SAMA tanpa
+  // challenge (regex di bawah cocok 1:1), jadi dicoba dulu.
+  const searchBases = ["https://www.twmanga.com", "https://www.baozimh.com"];
+
   const headers = new Headers();
   headers.set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
   headers.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
-  headers.set("Referer", "https://www.baozimh.com/");
 
-  const url = "https://www.baozimh.com/search?q=" + encodeURIComponent(query);
-  const res = await safeFetch(url, { method: "GET", headers });
-  if (!res.ok) throw new Error(`HTTP ${res.status} pada halaman pencarian`);
-  const html = await res.text();
+  let html = null;
+  let lastSearchErr = null;
+  for (const base of searchBases) {
+    try {
+      const h = new Headers(headers);
+      h.set("Referer", base + "/");
+      const res = await safeFetch(base + "/search?q=" + encodeURIComponent(query), { method: "GET", headers: h });
+      if (res.ok) { html = await res.text(); break; }
+      if (res.body) { try { await res.body.cancel(); } catch {} }
+      lastSearchErr = new Error(`HTTP ${res.status} pada ${base}`);
+    } catch (e) {
+      lastSearchErr = e;
+    }
+  }
+  if (html === null) throw lastSearchErr || new Error("Semua basis pencarian Baozimh gagal");
 
   const re = /<a href="\/comic\/([^"?#]+)"[^>]*title="([^"]+)"[^>]*class="comics-card__poster[^"]*"[\s\S]*?<amp-img[^>]*src="([^"]+)"/gi;
   const seen = new Set();
@@ -1348,31 +1364,29 @@ export default {
         BAOZI_APP_SUBDOMAIN_NUMBERS.map((n) => `appgb${n}.${domain}`)
       );
 
-      // Kredensial app baozimh WAJIB diisi lewat Cloudflare environment
-      // variable (Settings > Variables and Secrets di dashboard Worker) —
-      // tidak ada fallback nilai literal di sini secara sengaja, supaya
-      // file ini tetap bersih dari kredensial apa pun meski dibagikan.
-      // Kalau salah satu env var belum di-set, request ditolak dini dengan
-      // pesan jelas, bukan diam-diam gagal di tengah proses fetch.
-      const requiredBaoziEnvKeys = ["BAOZI_APP_ID", "BAOZI_DEVICE_CODE", "BAOZI_DEVICE_ID", "BAOZI_USER_AGENT", "BAOZI_APP_VERSION"];
-      const missingBaoziEnvKeys = requiredBaoziEnvKeys.filter((key) => !env || !env[key]);
-      if (missingBaoziEnvKeys.length > 0) {
-        return new Response(
-          JSON.stringify({
-            error: "Baozimh worker misconfigured",
-            detail: `Missing environment variable(s): ${missingBaoziEnvKeys.join(", ")}. Set them in Cloudflare Worker Settings > Variables and Secrets.`
-          }),
-          { status: 500, headers: { ...corsHeaders(request), "Content-Type": "application/json" } }
-        );
-      }
+      // Kredensial app baozimh: diambil dari environment bila ada
+      // (Settings > Variables and Secrets), fallback ke nilai bawaan yang
+      // terbaca dari worker baozi-downloader lama. Env selalu menang supaya
+      // rotasi kredensial tidak butuh deploy ulang kode.
+      // CATATAN: device-code di bawah dipakai BERSAMA semua pengguna worker
+      // ini — kalau Baozi me-rate-limit/memblokirnya, isi env var dengan
+      // kredensial segar (atau putar beberapa worker) tanpa ubah kode.
+      const BAOZI_DEFAULTS = {
+        BAOZI_APP_ID: "cn.sts.xiaoyun.ordermeals",
+        BAOZI_DEVICE_CODE: "6ca052067aa9833084daaa6ffeba0913",
+        BAOZI_DEVICE_ID: "RKQ1.201217.002",
+        BAOZI_USER_AGENT: "baozimh_android/1.0.31/gb/adset",
+        BAOZI_APP_VERSION: "1.0.31"
+      };
+      const baoziEnv = (key) => (env && env[key]) || BAOZI_DEFAULTS[key];
 
       const baoziHeaders = new Headers();
       baoziHeaders.set("Referer", "https://appgb.baozimh.com/");
-      baoziHeaders.set("app-id", env.BAOZI_APP_ID);
-      baoziHeaders.set("device-code", env.BAOZI_DEVICE_CODE);
-      baoziHeaders.set("device-id", env.BAOZI_DEVICE_ID);
-      baoziHeaders.set("user-agent", env.BAOZI_USER_AGENT);
-      baoziHeaders.set("app-version", env.BAOZI_APP_VERSION);
+      baoziHeaders.set("app-id", baoziEnv("BAOZI_APP_ID"));
+      baoziHeaders.set("device-code", baoziEnv("BAOZI_DEVICE_CODE"));
+      baoziHeaders.set("device-id", baoziEnv("BAOZI_DEVICE_ID"));
+      baoziHeaders.set("user-agent", baoziEnv("BAOZI_USER_AGENT"));
+      baoziHeaders.set("app-version", baoziEnv("BAOZI_APP_VERSION"));
       baoziHeaders.set("Accept-Encoding", "gzip");
       baoziHeaders.set("Connection", "Keep-Alive");
 
@@ -1480,10 +1494,38 @@ export default {
       pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
       pageHeaders.set("Referer", "https://www.baozimh.com/");
 
+      // KOREKSI: www.baozimh.com memberlakukan gatekeeper challenge
+      // (HTTP 403 {"error":"challenge_required"}) untuk fetch server-side —
+      // terverifikasi: homepage, /search, dan /comic/{slug} semua ditolak
+      // walau UA diganti. Solusinya: halaman series yang SAMA (struktur AMP
+      // identik, regex chapter di bawah cocok 1:1) dilayani tanpa challenge
+      // oleh www.twmanga.com — jadi itu dicoba DULU. baozimh.com tetap
+      // disimpan sebagai fallback kalau challenge-nya dicabut nanti.
+      // (Catatan: host app appgb*.baozimh.com memang tidak di-challenge,
+      // tapi halaman series-nya ber-markup beda sehingga tidak bisa dipakai
+      // sebagai fallback drop-in — hanya twmanga yang struktur HTML-nya sama.)
+      const seriesCandidates = [
+        { url: `https://www.twmanga.com/comic/${comicSlug}`, referer: "https://www.twmanga.com/" },
+        { url: `https://www.baozimh.com/comic/${comicSlug}`, referer: "https://www.baozimh.com/" }
+      ];
+
+      let pageRes = null;
+      let lastSeriesErr = null;
+      for (const candidate of seriesCandidates) {
+        try {
+          const headers = new Headers(pageHeaders);
+          headers.set("Referer", candidate.referer);
+          const res = await safeFetch(candidate.url, { method: "GET", headers });
+          if (res.ok) { pageRes = res; break; }
+          if (res.body) { try { await res.body.cancel(); } catch {} }
+          lastSeriesErr = new Error(`HTTP ${res.status} dari ${candidate.url}`);
+        } catch (e) {
+          lastSeriesErr = e;
+        }
+      }
+      if (!pageRes) throw lastSeriesErr || new Error("Semua kandidat halaman series gagal");
+
       try {
-        const seriesUrl = `https://www.baozimh.com/comic/${comicSlug}`;
-        const pageRes = await safeFetch(seriesUrl, { method: "GET", headers: pageHeaders });
-        if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
         const html = await pageRes.text();
 
         const chapterLinkRe = /href="\/user\/page_direct\?comic_id=([^&]+)&amp;section_slot=(\d+)&amp;chapter_slot=(\d+)"[^>]*class="comics-chapters__item"[^>]*><div[^>]*><span[^>]*>([^<]+)<\/span>/g;

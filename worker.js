@@ -739,65 +739,19 @@ async function searchRumanhua(request, query) {
 
 // Manwang: halaman publik GET /index.php/search?key=. Dua template hasil
 // (baru: comic-item + h2 + data-src; lama: booktitle + commandDes) —
-// digabung, dedupe per URL.
+// Manwang search DINONAKTIFKAN: manwang.net memblokir IP egress Cloudflare
+// secara permanen untuk endpoint search (series + chapter masih works).
+// Pengguna tetap bisa akses Manwang dengan paste URL series/chapter langsung.
 async function searchManwang(request, query) {
-  const headers = new Headers();
-  headers.set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
-  headers.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
-  headers.set("Referer", "https://manwang.net/");
-  // Header ini WAJIB — tanpa Sec-Fetch-Dest: document, manwang.net
-  // membalas 16-32 byte (diblokir) alih-alih halaman hasil search.
-  headers.set("Sec-Fetch-Dest", "document");
-
-  const url = "https://manwang.net/index.php/search?key=" + encodeURIComponent(query);
-  // Manwang kadang memblokir IP egress Cloudflare secara intermiten
-  // (403 sesaat). Coba 2× sebelum menyerah.
-  let searchHtml;
-  let searchErr;
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      const res = await safeFetch(url, { method: "GET", headers });
-      if (!res.ok) throw new Error(`HTTP ${res.status} pada halaman pencarian`);
-      searchHtml = await res.text();
-      break;
-    } catch (e) {
-      searchErr = e;
-      if (attempt < 2) await new Promise((r) => setTimeout(r, 2000));
+  return jsonResponse(request, {
+    source: "manwang",
+    query,
+    total: 0,
+    results: [],
+    debug: {
+      note: "Manwang search is blocked by the origin (Cloudflare IP blocking). Series and chapter endpoints still work."
     }
-  }
-  if (!searchHtml) throw new Error(`HTTP ${searchErr?.message ?? "unknown"} pada halaman pencarian`);
-  const html = searchHtml;
-
-  // Dua pola hasil (template baru: comic-item + h2 + data-src cover;
-  // lama: booktitle + commandDes author) — digabung, dedupe per URL.
-  const pushResult = (path, title, cover, author) => {
-    if (seen.has(path)) return;
-    seen.add(path);
-    results.push({ title: title.trim(), url: `https://manwang.net${path}`, cover: cover.trim(), author: (author || "").trim() });
-  };
-
-  const seen = new Set();
-  const results = [];
-  let m;
-  const reA = /<a href="(\/book\/\d+)" class="comic-item">[\s\S]*?data-src="([^"]+)"[\s\S]*?<h2 class="ui-nowrap">([^<]+)<\/h2>/gi;
-  while ((m = reA.exec(html)) !== null && results.length < 30) {
-    pushResult(m[1], m[3], m[2], "");
-  }
-  const reB = /<a href="(\/book\/\d+)">[\s\S]*?<img src="([^"]+)"[^>]*>[\s\S]*?<span class="booktitle">([^<]+)<\/span>[\s\S]*?<p class="commandDes">([^<]*)<\/p>/gi;
-  while ((m = reB.exec(html)) !== null && results.length < 30) {
-    pushResult(m[1], m[3], m[2], m[4]);
-  }
-
-  // DebugHTML ikut dikirim agar ketahuan bila edge Cloudflare menerima
-  // halaman berbeda (mis. interstitial challenge) dari yang terlihat di
-  // browser HP — frontend mengabaikan field ini.
-  const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
-  const debug = {
-    pageTitle: titleMatch ? titleMatch[1].trim().slice(0, 120) : null,
-    htmlSample: html.slice(0, 500)
-  };
-
-  return jsonResponse(request, { source: "manwang", query, total: results.length, results, debug });
+  });
 }
 
 export default {

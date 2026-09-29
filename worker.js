@@ -65,11 +65,9 @@ const ALLOWED_HOST_SUFFIXES = [
   "bzcdn.net",
   // Domain inti kedua untuk app Baozi (lihat catatan APPGB_HOST_RE di
   // atas) — appgb1.bzmgapp.com sudah terverifikasi dipakai selain
-  // appgb3.baozimh.com.
-  "bzmgapp.com",
-  "manwa.me",
-  "mwappimgs.cc",
-  "wmanhua.com",
+   // appgb3.baozimh.com.
+   "bzmgapp.com",
+   "wmanhua.com",
   "koudaimh.com",
   // CDN gambar Koudaimh dapat memakai host terpisah dari halaman chapter.
   // Host ini tetap dibatasi suffix-nya; jangan mengubah proxy menjadi open proxy.
@@ -747,11 +745,28 @@ async function searchManwang(request, query) {
   headers.set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
   headers.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
   headers.set("Referer", "https://manwang.net/");
+  // Header ini WAJIB — tanpa Sec-Fetch-Dest: document, manwang.net
+  // membalas 16-32 byte (diblokir) alih-alih halaman hasil search.
+  headers.set("Sec-Fetch-Dest", "document");
 
   const url = "https://manwang.net/index.php/search?key=" + encodeURIComponent(query);
-  const res = await safeFetch(url, { method: "GET", headers });
-  if (!res.ok) throw new Error(`HTTP ${res.status} pada halaman pencarian`);
-  const html = await res.text();
+  // Manwang kadang memblokir IP egress Cloudflare secara intermiten
+  // (403 sesaat). Coba 2× sebelum menyerah.
+  let searchHtml;
+  let searchErr;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await safeFetch(url, { method: "GET", headers });
+      if (!res.ok) throw new Error(`HTTP ${res.status} pada halaman pencarian`);
+      searchHtml = await res.text();
+      break;
+    } catch (e) {
+      searchErr = e;
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 2000));
+    }
+  }
+  if (!searchHtml) throw new Error(`HTTP ${searchErr?.message ?? "unknown"} pada halaman pencarian`);
+  const html = searchHtml;
 
   // Dua pola hasil (template baru: comic-item + h2 + data-src cover;
   // lama: booktitle + commandDes author) — digabung, dedupe per URL.
@@ -1743,167 +1758,6 @@ export default {
       }
     }
 
-    // manwa.me: URL gambar ada langsung di HTML (data-r-src), tapi isi filenya
-    // adalah ciphertext AES-128-CBC, bukan gambar biasa. Key & IV sama persis:
-    // "my2ecret782ecret" (statis, sudah diverifikasi lintas beberapa chapter/komik
-    // berbeda). Dua kasus ditangani di sini:
-    //   1. URL chapter (manwa.me/chapter/{id}) -> scrape halaman, balikin daftar url gambar
-    //   2. URL gambar (mwappimgs.cc/...) -> fetch ciphertext, decrypt, serve sebagai webp
-    const manwaChapterMatch = targetUrl.href.match(/^https?:\/\/(?:www\.)?manwa\.me\/chapter\/(\d+)/);
-    const manwaImageMatch = targetUrl.hostname === "mwappimgs.cc" || targetUrl.hostname.endsWith(".mwappimgs.cc");
-
-    if (manwaChapterMatch) {
-      const chapterId = manwaChapterMatch[1];
-
-      const pageHeaders = new Headers();
-      pageHeaders.set("User-Agent", "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36");
-      pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
-      pageHeaders.set("Referer", "https://manwa.me/");
-
-      try {
-        const pageRes = await safeFetch(targetUrl.toString(), { method: "GET", headers: pageHeaders });
-        if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
-        const html = await pageRes.text();
-
-        const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
-        const pageTitle = titleMatch ? titleMatch[1].trim() : "";
-        const titleParts = pageTitle.split(" - ");
-        const comicTitle = titleParts[0]?.trim() || "";
-        const chapterTitle = titleParts[1]?.trim() || "";
-
-        // Ambil tiap tag <img class="... content-img ... lazy_img ...">, lalu
-        // extract attribute data-r-src dari masing-masing tag itu.
-        const imgTagRegex = /<img\b[^>]*\bclass="[^"]*content-img[^"]*lazy_img[^"]*"[^>]*>/gi;
-        const imgTags = html.match(imgTagRegex) || [];
-
-        const comicImages = [];
-        let idx = 0;
-        for (const tag of imgTags) {
-          const srcMatch = tag.match(/\bdata-r-src="([^"]+)"/i);
-          if (!srcMatch) continue;
-          idx++;
-          comicImages.push({ page: idx, url: srcMatch[1] });
-        }
-
-        if (comicImages.length === 0) {
-          return new Response(
-            JSON.stringify({
-              error: "No comic images found in manwa.me chapter page",
-              note: "Expected <img class=\"content-img lazy_img\" data-r-src=\"...\"> tags. The site may have changed its markup.",
-              debug: { chapterId, pageTitle, totalImgTagsFound: imgTags.length }
-            }),
-            { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
-          );
-        }
-
-        return new Response(JSON.stringify({
-          source: "manwa",
-          chapter_id: parseInt(chapterId),
-          comic_title: comicTitle,
-          chapter_title: chapterTitle,
-          page_title: pageTitle,
-          total_images: comicImages.length,
-          images: comicImages
-        }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
-      } catch (err) {
-        return new Response(JSON.stringify({ error: "manwa.me failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
-      }
-    }
-
-    if (manwaImageMatch) {
-      const imgHeaders = new Headers();
-      imgHeaders.set("User-Agent", "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36");
-      imgHeaders.set("Referer", "https://manwa.me/");
-
-      try {
-        const imgRes = await safeFetch(targetUrl.toString(), { method: "GET", headers: imgHeaders });
-        if (!imgRes.ok) throw new Error(`HTTP ${imgRes.status}`);
-
-        const encryptedBuffer = await imgRes.arrayBuffer();
-
-        const MANWA_AES_KEY = "my2ecret782ecret";
-        const keyBytes = new TextEncoder().encode(MANWA_AES_KEY);
-        const cryptoKey = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-CBC" }, false, ["decrypt"]);
-        const decryptedBuffer = await crypto.subtle.decrypt({ name: "AES-CBC", iv: keyBytes }, cryptoKey, encryptedBuffer);
-
-        return new Response(decryptedBuffer, {
-          status: 200,
-          headers: { ...corsHeaders(request), "Content-Type": "image/webp", "Cache-Control": "public, max-age=86400" }
-        });
-      } catch (err) {
-        return new Response(JSON.stringify({ error: "manwa.me image decrypt failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
-      }
-    }
-
-    // manwa.me: URL SERIES (bukan chapter, bukan gambar). Halaman series
-    // (manwa.me/book/{id}) render semua chapter langsung di HTML dalam
-    // <a href="/chapter/{id}" title="{judul}" class="chapteritem"> —
-    // sudah diverifikasi manual pakai sampel 230 chapter, cocok persis
-    // dengan "第230话" (chapter terbaru) yang tertulis di halaman, tanpa
-    // duplikat dan tanpa pagination.
-    //
-    // PENTING: urutan HTML aslinya TERLAMA -> TERBARU (chapter 1 di atas),
-    // kebalikan dari wmanhua/baozimh/jjaptoon yang semuanya terbaru dulu.
-    // Dibalik di sini (reverse array) supaya konsisten "terbaru di atas"
-    // sesuai kesepakatan lintas platform.
-    //
-    // Catatan: beberapa judul chapter di situs ini memakai angka Han
-    // (misal "第十五话"), dan ada juga kesalahan penomoran dari situsnya
-    // sendiri (satu chapter di posisi ke-11 berjudul "第1话" alih-alih
-    // "第11话") — keduanya dibiarkan apa adanya, tidak dinormalisasi.
-    const manwaSeriesMatch = targetUrl.href.match(/^https?:\/\/(?:www\.)?manwa\.me\/book\/(\d+)/);
-    if (manwaSeriesMatch) {
-      const bookId = manwaSeriesMatch[1];
-
-      const pageHeaders = new Headers();
-      pageHeaders.set("User-Agent", "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36");
-      pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
-      pageHeaders.set("Referer", "https://manwa.me/");
-
-      try {
-        const pageRes = await safeFetch(targetUrl.toString(), { method: "GET", headers: pageHeaders });
-        if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
-        const html = await pageRes.text();
-
-        const chapterLinkRe = /<a href="\/chapter\/(\d+)" title="([^"]+)"\s*class="chapteritem\s*">/g;
-
-        const chapters = [];
-        let m;
-        while ((m = chapterLinkRe.exec(html)) !== null) {
-          const [, chapterId, title] = m;
-          chapters.push({
-            chapter_id: chapterId,
-            chapter_title: title.trim(),
-            url: `https://manwa.me/chapter/${chapterId}`
-          });
-        }
-
-        // Balik urutan: HTML asli terlama->terbaru, kita mau terbaru->terlama.
-        chapters.reverse();
-
-        if (chapters.length === 0) {
-          return new Response(
-            JSON.stringify({
-              error: "No chapters found in manwa.me series page",
-              note: "Expected <a href=\"/chapter/{id}\" title=\"...\" class=\"chapteritem\"> links. The site may have changed its markup.",
-              debug: { bookId }
-            }),
-            { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
-          );
-        }
-
-        return new Response(JSON.stringify({
-          source: "manwa",
-          type: "series",
-          book_id: bookId,
-          total_chapters: chapters.length,
-          chapters
-        }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
-      } catch (err) {
-        return new Response(JSON.stringify({ error: "manwa.me series fetch failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
-      }
-    }
-
     // wmanhua.com: tidak ada enkripsi/signing sama sekali. Chapter HTML embed dua
     // variabel JS polos: `var num = eval("239")` (total halaman, isinya cuma angka
     // literal, eval() di sini kosmetik) dan `var pasd = "https://.../{uuid}/"` (base
@@ -2477,11 +2331,25 @@ export default {
       pageHeaders.set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
       pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
       pageHeaders.set("Referer", "https://manwang.net/");
+      pageHeaders.set("Sec-Fetch-Dest", "document");
 
       try {
-        const pageRes = await safeFetch(targetUrl.toString(), { method: "GET", headers: pageHeaders });
-        if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
-        const html = await pageRes.text();
+        // Coba 2× — Manwang kadang 403 intermiten dari IP Cloudflare.
+        let chHtml;
+        let chErr;
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          try {
+            const pageRes = await safeFetch(targetUrl.toString(), { method: "GET", headers: pageHeaders });
+            if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
+            chHtml = await pageRes.text();
+            break;
+          } catch (e) {
+            chErr = e;
+            if (attempt < 2) await new Promise((r) => setTimeout(r, 2000));
+          }
+        }
+        if (!chHtml) throw chErr;
+        const html = chHtml;
 
         const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
         const pageTitle = titleMatch ? titleMatch[1].trim() : "";
@@ -2573,6 +2441,7 @@ export default {
       pageHeaders.set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
       pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
       pageHeaders.set("Referer", "https://manwang.net/");
+      pageHeaders.set("Sec-Fetch-Dest", "document");
 
       try {
         const pageRes = await safeFetch(targetUrl.toString(), { method: "GET", headers: pageHeaders });

@@ -739,6 +739,16 @@ async function searchRumanhua(request, query) {
 
 // Manwang: halaman publik GET /index.php/search?key=. Dua template hasil
 // (baru: comic-item + h2 + data-src; lama: booktitle + commandDes) —
+// Manwang memblokir IP egress Cloudflare secara INTERMITEN (403/520 sesaat,
+// lalu normal lagi). Untuk Maximkan peluang tembus, tiap percobaan memakai
+// User-Agent berbeda + cache-buster, bukan mengulang request yang identik.
+const MANWANG_UA_POOL = [
+  "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+];
+
 // Manwang search DINONAKTIFKAN: manwang.net memblokir IP egress Cloudflare
 // secara permanen untuk endpoint search (series + chapter masih works).
 // Pengguna tetap bisa akses Manwang dengan paste URL series/chapter langsung.
@@ -2288,19 +2298,26 @@ export default {
       pageHeaders.set("Sec-Fetch-Dest", "document");
 
       try {
-        // Coba 2× — Manwang kadang 403 intermiten dari IP Cloudflare.
+        // Sama seperti handler series: blokir 403/520 di origin muncul-tentu,
+        // jadi 4 percobaan dengan jeda memanjang + rotasi User-Agent +
+        // cache-buster.Chapter読む punya payload params terenkripsi, jadi
+        // satu gagal fetch = satu chapter hilang untuk pengguna.
         let chHtml;
         let chErr;
-        for (let attempt = 1; attempt <= 2; attempt++) {
+        for (let attempt = 1; attempt <= 4; attempt++) {
+          const attemptHeaders = new Headers(pageHeaders);
+          attemptHeaders.set("User-Agent", MANWANG_UA_POOL[(attempt - 1) % MANWANG_UA_POOL.length]);
+          const tryUrl = new URL(targetUrl.toString());
+          if (attempt > 1) tryUrl.searchParams.set("_tf", String(attempt));
           try {
-            const pageRes = await safeFetch(targetUrl.toString(), { method: "GET", headers: pageHeaders });
+            const pageRes = await safeFetch(tryUrl.toString(), { method: "GET", headers: attemptHeaders });
             if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
             chHtml = await pageRes.text();
             break;
           } catch (e) {
             chErr = e;
-            if (attempt < 2) await new Promise((r) => setTimeout(r, 2000));
           }
+          if (attempt < 4) await new Promise((r) => setTimeout(r, 900 * attempt));
         }
         if (!chHtml) throw chErr;
         const html = chHtml;
@@ -2398,9 +2415,29 @@ export default {
       pageHeaders.set("Sec-Fetch-Dest", "document");
 
       try {
-        const pageRes = await safeFetch(targetUrl.toString(), { method: "GET", headers: pageHeaders });
-        if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
-        const html = await pageRes.text();
+        // Origin memblokir IP egress Cloudflare SECARA INTERMITEN (403/520
+        // muncul-tentu — halaman & chapter bisa normal di detik yang sama),
+        // jadi coba beberapa kali: jeda memanjang + ganti User-Agent +
+        // cache-buster tiap percobaan. Tanpa ini satu 403 langsung
+        // menggagalkan seluruh alur series di sisi pengguna.
+        let html;
+        let lastErr;
+        for (let attempt = 1; attempt <= 4; attempt++) {
+          const attemptHeaders = new Headers(pageHeaders);
+          attemptHeaders.set("User-Agent", MANWANG_UA_POOL[(attempt - 1) % MANWANG_UA_POOL.length]);
+          const tryUrl = new URL(targetUrl.toString());
+          if (attempt > 1) tryUrl.searchParams.set("_tf", String(attempt));
+          try {
+            const pageRes = await safeFetch(tryUrl.toString(), { method: "GET", headers: attemptHeaders });
+            if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
+            html = await pageRes.text();
+            break;
+          } catch (e) {
+            lastErr = e;
+          }
+          if (attempt < 4) await new Promise((r) => setTimeout(r, 900 * attempt));
+        }
+        if (!html) throw lastErr || new Error("Semua percobaan fetch gagal");
 
         const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
         const pageTitle = titleMatch ? titleMatch[1].trim() : "";

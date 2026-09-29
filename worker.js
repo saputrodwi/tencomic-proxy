@@ -739,9 +739,9 @@ async function searchRumanhua(request, query) {
   return jsonResponse(request, { source: "rumanhua", query, total: results.length, results });
 }
 
-// Manwang: halaman publik GET /index.php/search?key=. Tiap hasil:
-// <a href="/book/{id}">...<img src="{cover}">...</a>
-// <span class="booktitle">{judul}</span> <p class="commandDes">{author}</p>
+// Manwang: halaman publik GET /index.php/search?key=. Dua template hasil
+// (baru: comic-item + h2 + data-src; lama: booktitle + commandDes) —
+// digabung, dedupe per URL.
 async function searchManwang(request, query) {
   const headers = new Headers();
   headers.set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
@@ -753,21 +753,24 @@ async function searchManwang(request, query) {
   if (!res.ok) throw new Error(`HTTP ${res.status} pada halaman pencarian`);
   const html = await res.text();
 
-  const re = /<a href="(\/book\/\d+)">[\s\S]*?<img src="([^"]+)"[^>]*>[\s\S]*?<span class="booktitle">([^<]+)<\/span>[\s\S]*?<p class="commandDes">([^<]*)<\/p>/gi;
+  // Dua pola hasil (template baru: comic-item + h2 + data-src cover;
+  // lama: booktitle + commandDes author) — digabung, dedupe per URL.
+  const pushResult = (path, title, cover, author) => {
+    if (seen.has(path)) return;
+    seen.add(path);
+    results.push({ title: title.trim(), url: `https://manwang.net${path}`, cover: cover.trim(), author: (author || "").trim() });
+  };
+
   const seen = new Set();
   const results = [];
   let m;
-  while ((m = re.exec(html)) !== null) {
-    const path = m[1];
-    if (seen.has(path)) continue;
-    seen.add(path);
-    results.push({
-      title: m[3].trim(),
-      url: `https://manwang.net${path}`,
-      cover: m[2].trim(),
-      author: m[4].trim()
-    });
-    if (results.length >= 30) break;
+  const reA = /<a href="(\/book\/\d+)" class="comic-item">[\s\S]*?data-src="([^"]+)"[\s\S]*?<h2 class="ui-nowrap">([^<]+)<\/h2>/gi;
+  while ((m = reA.exec(html)) !== null && results.length < 30) {
+    pushResult(m[1], m[3], m[2], "");
+  }
+  const reB = /<a href="(\/book\/\d+)">[\s\S]*?<img src="([^"]+)"[^>]*>[\s\S]*?<span class="booktitle">([^<]+)<\/span>[\s\S]*?<p class="commandDes">([^<]*)<\/p>/gi;
+  while ((m = reB.exec(html)) !== null && results.length < 30) {
+    pushResult(m[1], m[3], m[2], m[4]);
   }
 
   // DebugHTML ikut dikirim agar ketahuan bila edge Cloudflare menerima
@@ -2559,10 +2562,9 @@ export default {
       }
     }
 
-    // manwang.net: URL SERIES (/book/{id}). Daftar chapter server-rendered:
-    // <a href="/chapter/{book}-{ch}">...<div class="w50">{judul}</div>.
-    // Header "titleBar" memuat status + chapter terbaru ("{status} | {latest}").
-    // Cover: img ecombdimg pertama di halaman.
+    // manwang.net: URL SERIES (/book/{id}). Dua template hidup
+    // berdampingan (baru: li[data-chapter] + h1 detail-title; lama:
+    // w50 + title underscore) — keduanya diparse + digabung.
     const manwangSeriesMatch = targetUrl.href.match(/^https?:\/\/(?:www\.)?manwang\.net\/book\/(\d+)/);
     if (manwangSeriesMatch) {
       const bookId = manwangSeriesMatch[1];
@@ -2579,53 +2581,90 @@ export default {
 
         const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
         const pageTitle = titleMatch ? titleMatch[1].trim() : "";
-        // Format: "{komik}_{komik}漫画_{komik}在线免费漫画-{situs}"
-        const comicTitle = (pageTitle.split("_")[0] || "").trim();
+        // Judul komik: template baru "<h1 class=detail-title>", lama
+        // "{komik}_{komik}漫画_...".
+        let comicTitle = "";
+        const h1Match = html.match(/<h1 class="detail-title[^"]*"[^>]*>([^<]+)<\/h1>/i);
+        if (h1Match) {
+          comicTitle = h1Match[1].trim();
+        } else {
+          comicTitle = (pageTitle.split("_")[0] || "").trim();
+        }
 
-        // Cover: background-image di div .back/.cover (bukan tag <img>).
+        // Cover: template baru lazyload data-src, lama background-image.
+        // Ambil yang pertama ketemu.
         let cover = "";
-        const coverMatch = html.match(/background-image:\s*url\((https:\/\/[^)]*ecombdimg[^)]+)\)/i);
+        const coverMatch = html.match(/data-src="(https:\/\/[^"]*ecombdimg[^"]+)"/i) ||
+          html.match(/background-image:\s*url\((https:\/\/[^)]*ecombdimg[^)]+)\)/i) ||
+          html.match(/<img[^>]*src="(https:\/\/[^"]*ecombdimg[^"]+)"[^>]*>/i);
         if (coverMatch) cover = coverMatch[1];
 
-        // Header: <i class="fl" ...>STATUS</b> | LATEST</i> — ada tag
-        // stray </b> di dalam, jadi izinkan markup di antara segmen.
+        // Author + latest: template baru (<p class="author">,
+        // <span>更新至:...), lama (meta "是一部由...创作", titleBar).
+        let author = "";
+        const authorMatch = html.match(/<p class="author">([^<]+)<\/p>/i) ||
+          html.match(/是一部由([^创<]+)创作/);
+        if (authorMatch) author = authorMatch[1].trim();
+
         let status = "";
         let latest = "";
-        const headerMatch = html.match(/<i class="fl"[^>]*>([\s\S]*?)\|([\s\S]*?)<\/i>/);
-        if (headerMatch) {
-          const stripTags = (s) => s.replace(/<[^>]+>/g, "").trim();
-          status = stripTags(headerMatch[1]);
-          latest = stripTags(headerMatch[2]);
+        const updateMatch = html.match(/<span>更新至:(.+?)<\/span>/);
+        if (updateMatch) {
+          latest = updateMatch[1].trim();
+        } else {
+          const headerMatch = html.match(/<i class="fl"[^>]*>([\s\S]*?)\|([\s\S]*?)<\/i>/);
+          if (headerMatch) {
+            const stripTags = (s) => s.replace(/<[^>]+>/g, "").trim();
+            status = stripTags(headerMatch[1]);
+            latest = stripTags(headerMatch[2]);
+          }
         }
 
-        const linkRe = /href="(\/chapter\/(\d+)-(\d+))"[^>]*>[\s\S]*?<div class="w50">([^<]+)/g;
+        // Dua pola daftar chapter (situs menyajikan template berbeda ke
+        // klien berbeda — terverifikasi keduanya live):
+        //  A (baru): <li ... data-chapter="{ch}"><a title="{t}" href="/chapter/{book}-{ch}">
+        //  B (lama): <a href="/chapter/{book}-{ch}">...<div class="w50">{t}</div>
         const chapters = [];
         const seen = new Set();
-        let m;
-        while ((m = linkRe.exec(html)) !== null) {
-          const path = m[1];
-          if (seen.has(path)) continue;
-          seen.add(path);
-          const numMatch = m[4].match(/第(\d+)/);
+        const pushChapter = (book, ch, title, ord) => {
+          const url = `https://manwang.net/chapter/${book}-${ch}`;
+          if (seen.has(url)) return;
+          seen.add(url);
+          const numMatch = (title || "").match(/第(\d+)/);
           chapters.push({
-            chapter_id: `${m[2]}-${m[3]}`,
+            chapter_id: `${book}-${ch}`,
             chapter_num: numMatch ? parseInt(numMatch[1]) : null,
-            chapter_title: m[4].trim(),
-            url: `https://manwang.net${path}`
+            chapter_title: (title || "").trim(),
+            url,
+            _ord: ord !== undefined ? ord : null
           });
+        };
+
+        let m;
+        const linkReA = /<li[^>]*data-chapter="(\d+)"[^>]*>[\s\S]*?<a[^>]*title="([^"]+)"[^>]*href="(\/chapter\/(\d+)-(\d+))"/g;
+        while ((m = linkReA.exec(html)) !== null) {
+          const orderMatch = m[0].match(/data-id="(\d+)"/);
+          pushChapter(m[4], m[1], m[2], orderMatch ? parseInt(orderMatch[1]) : null);
+        }
+        const linkReB = /href="(\/chapter\/(\d+)-(\d+))"[^>]*>[\s\S]*?<div class="w50">([^<]+)/g;
+        while ((m = linkReB.exec(html)) !== null) {
+          pushChapter(m[2], m[3], m[4], null);
         }
 
-        // Urutkan terbaru->terlama bila nomor chapter terparse; kalau tidak,
-        // pertahankan urutan HTML apa adanya.
+        // Urutkan terbaru->terlama: pakai nomor chapter bila lengkap, kalau
+        // tidak pakai urutan data-id, terakhir pertahankan urutan HTML.
         if (chapters.length > 0 && chapters.every((c) => c.chapter_num !== null)) {
           chapters.sort((a, b) => b.chapter_num - a.chapter_num);
+        } else if (chapters.length > 0 && chapters.every((c) => c._ord !== null)) {
+          chapters.sort((a, b) => b._ord - a._ord);
         }
+        for (const c of chapters) delete c._ord;
 
         if (chapters.length === 0) {
           return new Response(
             JSON.stringify({
               error: "No chapters found in manwang series page",
-              note: "Expected <a href=\"/chapter/{book}-{id}\">...<div class=\"w50\">{title}</div> entries. The site may have changed its markup.",
+              note: "Expected chapter links (/show pattern A or w50 pattern B). The site may have changed its markup.",
               debug: { bookId, pageTitle: pageTitle.slice(0, 120), htmlSample: html.slice(0, 500) }
             }),
             { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}

@@ -80,7 +80,11 @@ const ALLOWED_HOST_SUFFIXES = [
   // chapter umumnya di shimolife bertanda tangan (sudah di atas).
   "rumanhua.org",
   "ecombdimg.com",
-  "baipiaoguai.org"
+  "baipiaoguai.org",
+  // Manwang (situs kembar Rumanhua: ID komik sama, alur params terenkripsi
+  // sama, kunci SAMA persis — terverifikasi dekripsi cocok). Halaman di
+  // manwang.net, cover di ecombdimg.com (sudah di atas).
+  "manwang.net"
 ];
 
 function isHostAllowed(hostname) {
@@ -320,9 +324,10 @@ async function handleSearch(request, reqUrl) {
     if (source === "jjaptoon") return await searchJjaptoon(request, reqUrl, query);
     if (source === "goodtoon") return await searchGoodtoon(request, reqUrl, query);
     if (source === "rumanhua") return await searchRumanhua(request, query);
+    if (source === "manwang") return await searchManwang(request, query);
     return jsonResponse(request, {
       error: "Sumber pencarian tidak didukung",
-      detail: "Pilih salah satu: baozimh, wmanhua, jjabtoon, koudaimh, jjaptoon, goodtoon, rumanhua."
+      detail: "Pilih salah satu: baozimh, wmanhua, jjabtoon, koudaimh, jjaptoon, goodtoon, rumanhua, manwang."
     }, 400);
   } catch (err) {
     return jsonResponse(request, { error: `${source || "search"} search failed`, detail: err.message }, 502);
@@ -734,6 +739,40 @@ async function searchRumanhua(request, query) {
   return jsonResponse(request, { source: "rumanhua", query, total: results.length, results });
 }
 
+// Manwang: halaman publik GET /index.php/search?key=. Tiap hasil:
+// <a href="/book/{id}">...<img src="{cover}">...</a>
+// <span class="booktitle">{judul}</span> <p class="commandDes">{author}</p>
+async function searchManwang(request, query) {
+  const headers = new Headers();
+  headers.set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
+  headers.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+  headers.set("Referer", "https://manwang.net/");
+
+  const url = "https://manwang.net/index.php/search?key=" + encodeURIComponent(query);
+  const res = await safeFetch(url, { method: "GET", headers });
+  if (!res.ok) throw new Error(`HTTP ${res.status} pada halaman pencarian`);
+  const html = await res.text();
+
+  const re = /<a href="(\/book\/\d+)">[\s\S]*?<img src="([^"]+)"[^>]*>[\s\S]*?<span class="booktitle">([^<]+)<\/span>[\s\S]*?<p class="commandDes">([^<]*)<\/p>/gi;
+  const seen = new Set();
+  const results = [];
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const path = m[1];
+    if (seen.has(path)) continue;
+    seen.add(path);
+    results.push({
+      title: m[3].trim(),
+      url: `https://manwang.net${path}`,
+      cover: m[2].trim(),
+      author: m[4].trim()
+    });
+    if (results.length >= 30) break;
+  }
+
+  return jsonResponse(request, { source: "manwang", query, total: results.length, results });
+}
+
 export default {
   async fetch(request, env) {
     const reqUrl = new URL(request.url);
@@ -762,7 +801,7 @@ export default {
     const referer = reqUrl.searchParams.get("referer") || reqUrl.searchParams.get("ref") || "";
 
     // PENCARIAN JUDUL (fitur baru, dipakai panel "Cari Judul" di frontend):
-    //   ?action=search&source={baozimh|wmanhua|jjabtoon|koudaimh|jjaptoon|goodtoon|rumanhua}&q={kata kunci}[&host=...]
+    //   ?action=search&source={baozimh|wmanhua|jjabtoon|koudaimh|jjaptoon|goodtoon|rumanhua|manwang}&q={kata kunci}[&host=...]
     // Mengembalikan daftar SERIES (bukan chapter) supaya hasilnya bisa
     // langsung dibuka lewat alur series picker yang sudah ada:
     //   { source, query, total, results: [{ title, url, cover, author }] }
@@ -785,6 +824,8 @@ export default {
     // (kunci sama dengan Manwa), didekripsi di sini lalu disajikan sebagai
     // gambar biasa. Dipakai frontend hanya untuk chapter bertanda
     // image_encrypted; chapter lain lewat generic proxy seperti biasa.
+    // Manwang memakai backend + kunci yang sama persis, jadi endpoint ini
+    // melayani kedua sumber (validasi host allowlist berlaku sama).
     if ((reqUrl.searchParams.get("action") || "").toLowerCase() === "rumanhua-img") {
       return handleRumanhuaImage(request, reqUrl);
     }
@@ -2232,8 +2273,12 @@ export default {
     // AES-128-CBC menjadi JSON { host, source_id, comic_id, chapter_id,
     // images[], lazy }. Kunci statis "9S8$vJnU2ANeSRoF", IV = 16 byte
     // pertama (terverifikasi identik lewat crypto-js maupun WebCrypto).
-    // Host check bawaan situs (params.host vs location.host) sengaja
-    // dilewati — blob yang diambil ya dari halaman itu sendiri.
+    // Host check bawaan situs dilewati pemanggil (blob diambil dari
+    // halaman itu sendiri).
+    // CATATAN OPERASIONAL: origin (satu IP langsung, tanpa CDN) memblokir
+    // IP egress Cloudflare Workers dengan 403 (terverifikasi dari worker
+    // production; dari IP lain 200 normal). Handler tetap dipertahankan —
+    // akan jalan lagi kalau blokir dibuka atau worker dipindah egress.
     // Cabang source_id: "12" = tiap gambar terenkripsi lagi (kunci Manwa)
     // dan harus lewat ?action=rumanhua-img; selain itu URL langsung.
     const rumanhuaChapterMatch = targetUrl.href.match(/^https?:\/\/(?:www\.)?rumanhua\.org\/show\/([^/?#]+)\.html/);
@@ -2403,6 +2448,194 @@ export default {
         }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
       } catch (err) {
         return new Response(JSON.stringify({ error: "rumanhua series fetch failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      }
+    }
+
+    // manwang.net: URL CHAPTER (/chapter/{bookId}-{chapterId}.html). Situs
+    // kembar Rumanhua (ID komik identik) — alur params terenkripsi + kunci
+    // AES SAMA persis (terverifikasi dekripsi cocok di chapter 121 asli),
+    // jadi dipakai decryptRumanhuaParams yang sama. Judul:
+    // "{komik}-{chapter}免费阅读-{situs}".
+    const manwangChapterMatch = targetUrl.href.match(/^https?:\/\/(?:www\.)?manwang\.net\/chapter\/(\d+)-(\d+)\/?(?:[?#].*)?$/);
+    if (manwangChapterMatch) {
+      const manwangBookId = manwangChapterMatch[1];
+      const manwangChapterId = manwangChapterMatch[2];
+
+      const pageHeaders = new Headers();
+      pageHeaders.set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
+      pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+      pageHeaders.set("Referer", "https://manwang.net/");
+
+      try {
+        const pageRes = await safeFetch(targetUrl.toString(), { method: "GET", headers: pageHeaders });
+        if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
+        const html = await pageRes.text();
+
+        const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+        const pageTitle = titleMatch ? titleMatch[1].trim() : "";
+        let comicTitle = "";
+        let chapterTitle = "";
+        const titleParts = pageTitle.match(/^(.*?)-(第.*?)免费阅读/);
+        if (titleParts) {
+          comicTitle = titleParts[1].trim();
+          chapterTitle = titleParts[2].trim();
+        } else {
+          chapterTitle = pageTitle;
+        }
+
+        const paramsMatch = html.match(/params\s*=\s*['"]([^'"]{100,})/);
+        if (!paramsMatch) {
+          return new Response(
+            JSON.stringify({
+              error: "No params blob found in manwang chapter page",
+              note: "Expected a `params = '...'` JS variable with encrypted data. The site may have changed its markup.",
+              debug: { manwangBookId, manwangChapterId }
+            }),
+            { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
+          );
+        }
+
+        let data;
+        try {
+          data = await decryptRumanhuaParams(paramsMatch[1]);
+        } catch (decryptErr) {
+          return new Response(
+            JSON.stringify({ error: "manwang params decrypt failed", detail: decryptErr.message }),
+            { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
+          );
+        }
+
+        const rawImages = Array.isArray(data.images) ? data.images : [];
+        const comicImages = rawImages
+          .map((entry, i) => {
+            const rawUrl = typeof entry === "string" ? entry : entry && (entry.url || entry.src);
+            if (!rawUrl || typeof rawUrl !== "string") return null;
+            let absolute;
+            try {
+              absolute = new URL(rawUrl.trim(), targetUrl.origin).toString();
+            } catch {
+              return null;
+            }
+            if (!["http:", "https:"].includes(new URL(absolute).protocol)) return null;
+            return { page: i + 1, url: absolute };
+          })
+          .filter(Boolean);
+
+        if (comicImages.length === 0) {
+          return new Response(
+            JSON.stringify({
+              error: "No comic images found in manwang chapter data",
+              note: "Decrypted successfully but images was empty/missing. The site may have changed its JSON shape.",
+              debug: { manwangBookId, manwangChapterId, decryptedKeys: data && typeof data === "object" ? Object.keys(data) : [] }
+            }),
+            { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
+          );
+        }
+
+        const imageEncrypted = String(data.source_id || "") === "12";
+
+        return new Response(JSON.stringify({
+          source: "manwang",
+          book_id: manwangBookId,
+          chapter_id: data.chapter_id ?? manwangChapterId,
+          comic_title: comicTitle,
+          chapter_title: chapterTitle,
+          page_title: pageTitle,
+          image_encrypted: imageEncrypted,
+          total_images: comicImages.length,
+          images: comicImages
+        }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "manwang chapter failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      }
+    }
+
+    // manwang.net: URL SERIES (/book/{id}). Daftar chapter server-rendered:
+    // <a href="/chapter/{book}-{ch}">...<div class="w50">{judul}</div>.
+    // Header "titleBar" memuat status + chapter terbaru ("{status} | {latest}").
+    // Cover: img ecombdimg pertama di halaman.
+    const manwangSeriesMatch = targetUrl.href.match(/^https?:\/\/(?:www\.)?manwang\.net\/book\/(\d+)/);
+    if (manwangSeriesMatch) {
+      const bookId = manwangSeriesMatch[1];
+
+      const pageHeaders = new Headers();
+      pageHeaders.set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
+      pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+      pageHeaders.set("Referer", "https://manwang.net/");
+
+      try {
+        const pageRes = await safeFetch(targetUrl.toString(), { method: "GET", headers: pageHeaders });
+        if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
+        const html = await pageRes.text();
+
+        const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+        const pageTitle = titleMatch ? titleMatch[1].trim() : "";
+        // Format: "{komik}_{komik}漫画_{komik}在线免费漫画-{situs}"
+        const comicTitle = (pageTitle.split("_")[0] || "").trim();
+
+        // Cover: background-image di div .back/.cover (bukan tag <img>).
+        let cover = "";
+        const coverMatch = html.match(/background-image:\s*url\((https:\/\/[^)]*ecombdimg[^)]+)\)/i);
+        if (coverMatch) cover = coverMatch[1];
+
+        // Header: <i class="fl" ...>STATUS</b> | LATEST</i> — ada tag
+        // stray </b> di dalam, jadi izinkan markup di antara segmen.
+        let status = "";
+        let latest = "";
+        const headerMatch = html.match(/<i class="fl"[^>]*>([\s\S]*?)\|([\s\S]*?)<\/i>/);
+        if (headerMatch) {
+          const stripTags = (s) => s.replace(/<[^>]+>/g, "").trim();
+          status = stripTags(headerMatch[1]);
+          latest = stripTags(headerMatch[2]);
+        }
+
+        const linkRe = /href="(\/chapter\/(\d+)-(\d+))"[^>]*>[\s\S]*?<div class="w50">([^<]+)/g;
+        const chapters = [];
+        const seen = new Set();
+        let m;
+        while ((m = linkRe.exec(html)) !== null) {
+          const path = m[1];
+          if (seen.has(path)) continue;
+          seen.add(path);
+          const numMatch = m[4].match(/第(\d+)/);
+          chapters.push({
+            chapter_id: `${m[2]}-${m[3]}`,
+            chapter_num: numMatch ? parseInt(numMatch[1]) : null,
+            chapter_title: m[4].trim(),
+            url: `https://manwang.net${path}`
+          });
+        }
+
+        // Urutkan terbaru->terlama bila nomor chapter terparse; kalau tidak,
+        // pertahankan urutan HTML apa adanya.
+        if (chapters.length > 0 && chapters.every((c) => c.chapter_num !== null)) {
+          chapters.sort((a, b) => b.chapter_num - a.chapter_num);
+        }
+
+        if (chapters.length === 0) {
+          return new Response(
+            JSON.stringify({
+              error: "No chapters found in manwang series page",
+              note: "Expected <a href=\"/chapter/{book}-{id}\">...<div class=\"w50\">{title}</div> entries. The site may have changed its markup.",
+              debug: { bookId }
+            }),
+            { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
+          );
+        }
+
+        return new Response(JSON.stringify({
+          source: "manwang",
+          type: "series",
+          book_id: bookId,
+          comic_title: comicTitle,
+          cover,
+          status,
+          latest,
+          total_chapters: chapters.length,
+          chapters
+        }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "manwang series fetch failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
       }
     }
 

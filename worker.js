@@ -74,7 +74,13 @@ const ALLOWED_HOST_SUFFIXES = [
   // CDN gambar Koudaimh dapat memakai host terpisah dari halaman chapter.
   // Host ini tetap dibatasi suffix-nya; jangan mengubah proxy menjadi open proxy.
   "koudaimg.com",
-  "shimolife.com"
+  "shimolife.com",
+  // Rumanhua (situs kembar Manwang, backend sama): halaman di rumanhua.org,
+  // cover di ecombdimg.com, mirror cadangan img1.baipiaoguai.org. Gambar
+  // chapter umumnya di shimolife bertanda tangan (sudah di atas).
+  "rumanhua.org",
+  "ecombdimg.com",
+  "baipiaoguai.org"
 ];
 
 function isHostAllowed(hostname) {
@@ -313,9 +319,10 @@ async function handleSearch(request, reqUrl) {
     if (source === "koudaimh") return await searchKoudaimh(request, query);
     if (source === "jjaptoon") return await searchJjaptoon(request, reqUrl, query);
     if (source === "goodtoon") return await searchGoodtoon(request, reqUrl, query);
+    if (source === "rumanhua") return await searchRumanhua(request, query);
     return jsonResponse(request, {
       error: "Sumber pencarian tidak didukung",
-      detail: "Pilih salah satu: baozimh, wmanhua, jjabtoon, koudaimh, jjaptoon, goodtoon."
+      detail: "Pilih salah satu: baozimh, wmanhua, jjabtoon, koudaimh, jjaptoon, goodtoon, rumanhua."
     }, 400);
   } catch (err) {
     return jsonResponse(request, { error: `${source || "search"} search failed`, detail: err.message }, 502);
@@ -587,7 +594,7 @@ async function searchGoodtoon(request, reqUrl, query) {
     }
     bases.push(`https://${hostParam}`);
   } else {
-    bases.push("https://goodtoon.top", "https://www.goodtoon004.com");
+    bases.push("https://goodtoon.top", "https://www.goodtoon005.com");
   }
 
   const headers = new Headers();
@@ -637,6 +644,96 @@ async function searchGoodtoon(request, reqUrl, query) {
   return jsonResponse(request, { source: "goodtoon", query, total: results.length, results });
 }
 
+// Rumanhua: dekripsi blob `params` halaman chapter (lihat catatan di
+// handler chapter). Base64 -> AES-128-CBC, kunci statis, IV = 16 byte
+// pertama. Host check bawaan situs dilewati pemanggil (blob diambil dari
+// halaman itu sendiri).
+const RUMANHUA_PARAMS_KEY = "9S8$vJnU2ANeSRoF";
+const RUMANHUA_IMAGE_KEY = "my2ecret782ecret";
+
+async function decryptRumanhuaParams(paramsBase64) {
+  const padded = paramsBase64.replace(/\s+/g, "") + "=".repeat((4 - (paramsBase64.replace(/\s+/g, "").length % 4)) % 4);
+  const raw = Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
+  if (raw.length <= 16) throw new Error("Payload terlalu pendek");
+  const keyBytes = new TextEncoder().encode(RUMANHUA_PARAMS_KEY);
+  const cryptoKey = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-CBC" }, false, ["decrypt"]);
+  const plain = await crypto.subtle.decrypt(
+    { name: "AES-CBC", iv: raw.slice(0, 16) },
+    cryptoKey,
+    raw.slice(16)
+  );
+  return JSON.parse(new TextDecoder("utf-8").decode(plain));
+}
+
+async function handleRumanhuaImage(request, reqUrl) {
+  const target = reqUrl.searchParams.get("url") || "";
+  let targetUrl;
+  try {
+    targetUrl = new URL(target);
+  } catch {
+    return jsonResponse(request, { error: "Invalid ?url=" }, 400);
+  }
+  if (!["http:", "https:"].includes(targetUrl.protocol) || !isHostAllowed(targetUrl.hostname)) {
+    return jsonResponse(request, { error: "Host not allowed", hostname: targetUrl.hostname }, 403);
+  }
+
+  const imgHeaders = new Headers();
+  imgHeaders.set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
+  imgHeaders.set("Referer", "https://www.rumanhua.org/");
+
+  try {
+    const imgRes = await safeFetch(targetUrl.toString(), { method: "GET", headers: imgHeaders });
+    if (!imgRes.ok) throw new Error(`HTTP ${imgRes.status}`);
+
+    const encryptedBuffer = await imgRes.arrayBuffer();
+
+    const keyBytes = new TextEncoder().encode(RUMANHUA_IMAGE_KEY);
+    const cryptoKey = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-CBC" }, false, ["decrypt"]);
+    const decryptedBuffer = await crypto.subtle.decrypt({ name: "AES-CBC", iv: keyBytes }, cryptoKey, encryptedBuffer);
+
+    return new Response(decryptedBuffer, {
+      status: 200,
+      headers: { ...corsHeaders(request), "Content-Type": "image/jpeg", "Cache-Control": "public, max-age=86400" }
+    });
+  } catch (err) {
+    return jsonResponse(request, { error: "rumanhua image decrypt failed", detail: err.message }, 502);
+  }
+}
+
+// Rumanhua: halaman publik GET /index.php/search?key=. Tiap hasil:
+// <div class="item ib">...<a href="/news/{id}">...<img class="cover"
+// src="{cover}">...<p class="title"><a>...</a></p>
+async function searchRumanhua(request, query) {
+  const headers = new Headers();
+  headers.set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
+  headers.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+  headers.set("Referer", "https://www.rumanhua.org/");
+
+  const url = "https://www.rumanhua.org/index.php/search?key=" + encodeURIComponent(query);
+  const res = await safeFetch(url, { method: "GET", headers });
+  if (!res.ok) throw new Error(`HTTP ${res.status} pada halaman pencarian`);
+  const html = await res.text();
+
+  const re = /<div class="item ib"[^>]*>[\s\S]*?<a href="(\/news\/\d+)">[\s\S]*?<img class="cover" src="([^"]+)"[^>]*>[\s\S]*?<p class="title"><a[^>]*>([^<]+)<\/a>/gi;
+  const seen = new Set();
+  const results = [];
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const path = m[1];
+    if (seen.has(path)) continue;
+    seen.add(path);
+    results.push({
+      title: m[3].trim(),
+      url: `https://www.rumanhua.org${path}`,
+      cover: m[2].trim(),
+      author: ""
+    });
+    if (results.length >= 30) break;
+  }
+
+  return jsonResponse(request, { source: "rumanhua", query, total: results.length, results });
+}
+
 export default {
   async fetch(request, env) {
     const reqUrl = new URL(request.url);
@@ -665,7 +762,7 @@ export default {
     const referer = reqUrl.searchParams.get("referer") || reqUrl.searchParams.get("ref") || "";
 
     // PENCARIAN JUDUL (fitur baru, dipakai panel "Cari Judul" di frontend):
-    //   ?action=search&source={baozimh|wmanhua|jjabtoon|koudaimh|jjaptoon|goodtoon}&q={kata kunci}[&host=...]
+    //   ?action=search&source={baozimh|wmanhua|jjabtoon|koudaimh|jjaptoon|goodtoon|rumanhua}&q={kata kunci}[&host=...]
     // Mengembalikan daftar SERIES (bukan chapter) supaya hasilnya bisa
     // langsung dibuka lewat alur series picker yang sudah ada:
     //   { source, query, total, results: [{ title, url, cover, author }] }
@@ -674,12 +771,22 @@ export default {
     // jjabtoon: GET /api/webtoons?search=, koudaimh: 2 langkah
     // GET /search lalu GET /search?q=&__searchtoken__=,
     // jjaptoon: GET /search?q=, goodtoon: GET /?s= via goodtoon.top yang
-    // redirect otomatis ke domain aktif). Manwa SENGAJA tidak disediakan:
+    // redirect otomatis ke domain aktif, rumanhua: GET /index.php/search?key=).
+    // Manwa SENGAJA tidak disediakan:
     // situsnya memang tidak punya menu pencarian sama sekali (diverifikasi
     // user dari akses langsung + 403 dari probe luar) — daripada
     // mengembalikan hasil palsu/rusak.
     if ((reqUrl.searchParams.get("action") || "").toLowerCase() === "search") {
       return handleSearch(request, reqUrl);
+    }
+
+    // Dekripsi gambar chapter Rumanhua source_id==12 (lihat catatan di
+    // handler chapter rumanhua): bytes yang diambil terenkripsi AES-128-CBC
+    // (kunci sama dengan Manwa), didekripsi di sini lalu disajikan sebagai
+    // gambar biasa. Dipakai frontend hanya untuk chapter bertanda
+    // image_encrypted; chapter lain lewat generic proxy seperti biasa.
+    if ((reqUrl.searchParams.get("action") || "").toLowerCase() === "rumanhua-img") {
+      return handleRumanhuaImage(request, reqUrl);
     }
 
     if (!target) {
@@ -2117,6 +2224,185 @@ export default {
         }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
       } catch (err) {
         return new Response(JSON.stringify({ error: "koudaimh series fetch failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      }
+    }
+
+    // rumanhua.org: URL CHAPTER (/show/{kode}.html). Halaman tidak memuat
+    // URL gambar polos — ada blob `params='...'` (base64) yang didekripsi
+    // AES-128-CBC menjadi JSON { host, source_id, comic_id, chapter_id,
+    // images[], lazy }. Kunci statis "9S8$vJnU2ANeSRoF", IV = 16 byte
+    // pertama (terverifikasi identik lewat crypto-js maupun WebCrypto).
+    // Host check bawaan situs (params.host vs location.host) sengaja
+    // dilewati — blob yang diambil ya dari halaman itu sendiri.
+    // Cabang source_id: "12" = tiap gambar terenkripsi lagi (kunci Manwa)
+    // dan harus lewat ?action=rumanhua-img; selain itu URL langsung.
+    const rumanhuaChapterMatch = targetUrl.href.match(/^https?:\/\/(?:www\.)?rumanhua\.org\/show\/([^/?#]+)\.html/);
+    if (rumanhuaChapterMatch) {
+      const showCode = rumanhuaChapterMatch[1];
+
+      const pageHeaders = new Headers();
+      pageHeaders.set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
+      pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+      pageHeaders.set("Referer", "https://www.rumanhua.org/");
+
+      try {
+        const pageRes = await safeFetch(targetUrl.toString(), { method: "GET", headers: pageHeaders });
+        if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
+        const html = await pageRes.text();
+
+        const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+        const pageTitle = titleMatch ? titleMatch[1].trim() : "";
+        // Format: "{komik}漫画-{chapter}在线阅读-{situs}"
+        let comicTitle = "";
+        let chapterTitle = "";
+        const titleParts = pageTitle.match(/^(.*?)漫画-(.*?)在线阅读/);
+        if (titleParts) {
+          comicTitle = titleParts[1].trim();
+          chapterTitle = titleParts[2].trim();
+        } else {
+          chapterTitle = pageTitle;
+        }
+
+        const paramsMatch = html.match(/params\s*=\s*['"]([^'"]{100,})/);
+        if (!paramsMatch) {
+          return new Response(
+            JSON.stringify({
+              error: "No params blob found in rumanhua chapter page",
+              note: "Expected a `params = '...'` JS variable with encrypted data. The site may have changed its markup.",
+              debug: { showCode }
+            }),
+            { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
+          );
+        }
+
+        let data;
+        try {
+          data = await decryptRumanhuaParams(paramsMatch[1]);
+        } catch (decryptErr) {
+          return new Response(
+            JSON.stringify({ error: "rumanhua params decrypt failed", detail: decryptErr.message }),
+            { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
+          );
+        }
+
+        const rawImages = Array.isArray(data.images) ? data.images : [];
+        const comicImages = rawImages
+          .map((entry, i) => {
+            const rawUrl = typeof entry === "string" ? entry : entry && (entry.url || entry.src);
+            if (!rawUrl || typeof rawUrl !== "string") return null;
+            let absolute;
+            try {
+              absolute = new URL(rawUrl.trim(), targetUrl.origin).toString();
+            } catch {
+              return null;
+            }
+            if (!["http:", "https:"].includes(new URL(absolute).protocol)) return null;
+            return { page: i + 1, url: absolute };
+          })
+          .filter(Boolean);
+
+        if (comicImages.length === 0) {
+          return new Response(
+            JSON.stringify({
+              error: "No comic images found in rumanhua chapter data",
+              note: "Decrypted successfully but images was empty/missing. The site may have changed its JSON shape.",
+              debug: { showCode, decryptedKeys: data && typeof data === "object" ? Object.keys(data) : [] }
+            }),
+            { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
+          );
+        }
+
+        const imageEncrypted = String(data.source_id || "") === "12";
+
+        return new Response(JSON.stringify({
+          source: "rumanhua",
+          chapter_code: showCode,
+          comic_id: data.comic_id ?? null,
+          chapter_id: data.chapter_id ?? null,
+          comic_title: comicTitle,
+          chapter_title: chapterTitle,
+          page_title: pageTitle,
+          image_encrypted: imageEncrypted,
+          total_images: comicImages.length,
+          images: comicImages
+        }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "rumanhua chapter failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      }
+    }
+
+    // rumanhua.org: URL SERIES (/news/{id}). Daftar chapter server-rendered:
+    // <a href="/show/{kode}">第N话...</a> (terurut tertua->terbaru di HTML).
+    // Cover: <img src alt="{judul komik}">. Author dari meta description
+    // ("...是一部由{author}创作的...").
+    const rumanhuaSeriesMatch = targetUrl.href.match(/^https?:\/\/(?:www\.)?rumanhua\.org\/news\/(\d+)/);
+    if (rumanhuaSeriesMatch) {
+      const bookId = rumanhuaSeriesMatch[1];
+
+      const pageHeaders = new Headers();
+      pageHeaders.set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
+      pageHeaders.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+      pageHeaders.set("Referer", "https://www.rumanhua.org/");
+
+      try {
+        const pageRes = await safeFetch(targetUrl.toString(), { method: "GET", headers: pageHeaders });
+        if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
+        const html = await pageRes.text();
+
+        const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+        const pageTitle = titleMatch ? titleMatch[1].trim() : "";
+        const comicTitle = (pageTitle.split("漫画")[0] || "").trim();
+
+        let cover = "";
+        if (comicTitle) {
+          const escaped = comicTitle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const coverMatch = html.match(new RegExp(`<img src="([^"]+)" alt="${escaped}"`, "i"));
+          if (coverMatch) cover = coverMatch[1];
+        }
+
+        let author = "";
+        const authorMatch = html.match(/是一部由([^创<]+)创作/);
+        if (authorMatch) author = authorMatch[1].trim();
+
+        const linkRe = /<a href="(\/show\/[^"]+)"[^>]*>([^<]*第\d+[^<]*)<\/a>/g;
+        const chapters = [];
+        const seen = new Set();
+        let m;
+        while ((m = linkRe.exec(html)) !== null) {
+          const path = m[1];
+          if (seen.has(path)) continue;
+          seen.add(path);
+          const codeMatch = path.match(/\/show\/([^/?#.]+)/);
+          chapters.push({
+            chapter_id: codeMatch ? codeMatch[1] : path,
+            chapter_title: m[2].trim(),
+            url: `https://www.rumanhua.org${path}`
+          });
+        }
+
+        if (chapters.length === 0) {
+          return new Response(
+            JSON.stringify({
+              error: "No chapters found in rumanhua series page",
+              note: "Expected <a href=\"/show/{code}\">第N话...</a> links. The site may have changed its markup.",
+              debug: { bookId }
+            }),
+            { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
+          );
+        }
+
+        return new Response(JSON.stringify({
+          source: "rumanhua",
+          type: "series",
+          book_id: bookId,
+          comic_title: comicTitle,
+          cover,
+          author,
+          total_chapters: chapters.length,
+          chapters
+        }, null, 2), { status: 200, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "rumanhua series fetch failed", detail: err.message }), { status: 502, headers: { ...corsHeaders(request), "Content-Type": "application/json" }});
       }
     }
 

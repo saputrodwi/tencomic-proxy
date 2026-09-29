@@ -770,7 +770,16 @@ async function searchManwang(request, query) {
     if (results.length >= 30) break;
   }
 
-  return jsonResponse(request, { source: "manwang", query, total: results.length, results });
+  // DebugHTML ikut dikirim agar ketahuan bila edge Cloudflare menerima
+  // halaman berbeda (mis. interstitial challenge) dari yang terlihat di
+  // browser HP — frontend mengabaikan field ini.
+  const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+  const debug = {
+    pageTitle: titleMatch ? titleMatch[1].trim().slice(0, 120) : null,
+    htmlSample: html.slice(0, 500)
+  };
+
+  return jsonResponse(request, { source: "manwang", query, total: results.length, results, debug });
 }
 
 export default {
@@ -2617,7 +2626,7 @@ export default {
             JSON.stringify({
               error: "No chapters found in manwang series page",
               note: "Expected <a href=\"/chapter/{book}-{id}\">...<div class=\"w50\">{title}</div> entries. The site may have changed its markup.",
-              debug: { bookId }
+              debug: { bookId, pageTitle: pageTitle.slice(0, 120), htmlSample: html.slice(0, 500) }
             }),
             { status: 404, headers: { ...corsHeaders(request), "Content-Type": "application/json" }}
           );
